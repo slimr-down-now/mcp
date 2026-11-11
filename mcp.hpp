@@ -1,8 +1,8 @@
 #pragma once
 
-#include "slimr/bugsink.hpp"
-#include "slimr/json.hpp"
-#include "slimr/reflect.hpp"
+#include "bugsink.hpp"
+#include "json.hpp"
+#include "reflect.hpp"
 
 #include <algorithm>
 #include <cstring>
