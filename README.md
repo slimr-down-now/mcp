@@ -125,16 +125,34 @@ never detached or forcibly terminated.
 | Attach Streamable HTTP CLI subcommand | `slimr::enable_http(app, httpOpts)` (links `slimr::mcp_http`) |
 | Run CLI, `mcp`, or `http` | `app.run(argc, argv)` |
 
-## Build & Test
+## Install
 
-This folder owns its headers, `test.cpp`, CMake target/config, manifest, port recipe and licenses. See the [integration guide](../../README.md#integration-vcpkg--cmakeninja).
+Add `bdombro/slimr-mcp` to `vcpkg-configuration.json`:
 
-```bash
-just test-pkg mcp  # Automatic native deps + ASan/UBSan
-just build-pkg mcp # Optimized Release build + tests
-just lint-pkg mcp  # Analyze the HTTP-enabled test translation unit
+```json
+{
+  "kind": "git",
+  "repository": "https://github.com/bdombro/slimr-mcp",
+  "baseline": "<commit-sha>",
+  "packages": [
+    "slimr-mcp",
+    "libhv"
+  ]
+}
 ```
 
-Stdio-only consumers link `slimr::mcp`; HTTP/OAuth servers enable the `"http"` feature in `vcpkg.json` (`{"name": "slimr-mcp", "features": ["http"]}`) and link `slimr::mcp_http` (which pulls libhv's `hv_static` target).
-Source test configurations require libhv and its `hv_static` target so HTTP tests
-cannot silently disappear. The shutdown implementation uses libhv 1.3.4 APIs.
+Declare `slimr-mcp` in `vcpkg.json` and link `slimr::mcp (or slimr::mcp_http with feature "http")` in `CMakeLists.txt`:
+
+```cmake
+find_package(slimr-mcp CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE slimr::mcp)
+```
+
+When using the `"http"` feature, list `"packages": ["slimr-mcp", "libhv"]` on the `slimr-mcp` registry entry so `libhv` resolves from this registry.
+
+## Build & Test
+
+```bash
+just test   # Debug build (ASan + UBSan) and run tests
+just build  # Optimized Release build
+```

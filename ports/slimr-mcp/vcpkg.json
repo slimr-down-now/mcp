@@ -1,0 +1,37 @@
+{
+  "name": "slimr-mcp",
+  "version": "0.1.2",
+  "description": "Header-only typed MCP servers and JSON CLIs",
+  "dependencies": [
+    {
+      "name": "slimr-bugsink",
+      "version>=": "0.1.1"
+    },
+    {
+      "name": "slimr-json",
+      "version>=": "0.1.1"
+    },
+    {
+      "name": "slimr-reflect",
+      "version>=": "0.1.1"
+    }
+  ],
+  "features": {
+    "http": {
+      "description": "Streamable HTTP and OAuth resource-server support via libhv",
+      "dependencies": [
+        "libhv"
+      ]
+    },
+    "tests": {
+      "description": "Dependencies for the standalone test suite",
+      "dependencies": [
+        "libhv",
+        {
+          "name": "slimr-test",
+          "version>=": "0.1.1"
+        }
+      ]
+    }
+  }
+}
