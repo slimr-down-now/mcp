@@ -295,7 +295,7 @@ class McpHttpServer {
             return b;
         }
         bool isV6 = false;
-        mcp_detail::is_valid_ip_literal(opts_.host, &isV6, nullptr);
+        mcp_detail::is_valid_ip_literal(opts_.host, &isV6);
         return "http://" + mcp_detail::format_authority_host(opts_.host, isV6) + ":" + std::to_string(boundPort());
     }
 
