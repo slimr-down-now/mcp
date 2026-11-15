@@ -16,23 +16,22 @@ namespace mcp_detail {
 
 inline std::optional<std::string> base64_decode(std::string_view input) {
     static constexpr int kDec[256] = {
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,62,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,63,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
-    };
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, 62, -1, 63,
+        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, 63,
+        -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
 
     std::string out;
     out.reserve((input.size() / 4) * 3);
@@ -42,12 +41,14 @@ inline std::optional<std::string> base64_decode(std::string_view input) {
         unsigned char c = static_cast<unsigned char>(input[i]);
         if (c == '=') {
             for (size_t j = i + 1; j < input.size(); ++j) {
-                if (input[j] != '=') return std::nullopt;
+                if (input[j] != '=')
+                    return std::nullopt;
             }
             break;
         }
         int d = kDec[c];
-        if (d == -1) return std::nullopt;
+        if (d == -1)
+            return std::nullopt;
         val = (val << 6) + d;
         valb += 6;
         if (valb >= 0) {
@@ -81,10 +82,11 @@ inline std::string base64_encode(std::string_view input) {
     return out;
 }
 
-inline std::string join_scopes(const std::vector<std::string>& scopes) {
+inline std::string join_scopes(const std::vector<std::string> &scopes) {
     std::string out;
     for (size_t i = 0; i < scopes.size(); ++i) {
-        if (i > 0) out.push_back(' ');
+        if (i > 0)
+            out.push_back(' ');
         out += scopes[i];
     }
     return out;
@@ -104,13 +106,15 @@ struct HttpRouteRequest {
 
     std::optional<std::string> header(std::string_view name) const {
         auto it = headers.find(mcp_detail::ascii_lower(name));
-        if (it == headers.end()) return std::nullopt;
+        if (it == headers.end())
+            return std::nullopt;
         return it->second;
     }
 
     std::optional<std::string> query(std::string_view name) const {
         auto it = queryParams.find(std::string(name));
-        if (it == queryParams.end()) return std::nullopt;
+        if (it == queryParams.end())
+            return std::nullopt;
         return it->second;
     }
 };
@@ -122,7 +126,7 @@ struct HttpRouteResponse {
     std::map<std::string, std::string> headers;
     std::string body;
 
-    static HttpRouteResponse json(int statusCode, const Json& value) {
+    static HttpRouteResponse json(int statusCode, const Json &value) {
         HttpRouteResponse r;
         r.status = statusCode;
         r.contentType = "application/json";
@@ -152,7 +156,7 @@ struct CustomHttpRoute {
     std::string method; // GET, POST, DELETE, etc. (or "*" for any)
     std::string path;
     bool enforceSameOrigin{true};
-    std::function<HttpRouteResponse(const HttpRouteRequest&)> handler;
+    std::function<HttpRouteResponse(const HttpRouteRequest &)> handler;
 };
 
 /** RFC 9728 Protected Resource Metadata published by the MCP resource server. */
@@ -168,20 +172,25 @@ struct OAuthResourceMetadata {
         Json j = json_obj();
         j["resource"] = resource.empty() ? std::string(effectiveResource) : resource;
         Json::array_t asArr;
-        for (const auto& s : authorizationServers) asArr.emplace_back(s);
+        for (const auto &s : authorizationServers)
+            asArr.emplace_back(s);
         j["authorization_servers"] = json_arr(std::move(asArr));
 
         if (!scopesSupported.empty()) {
             Json::array_t scArr;
-            for (const auto& s : scopesSupported) scArr.emplace_back(s);
+            for (const auto &s : scopesSupported)
+                scArr.emplace_back(s);
             j["scopes_supported"] = json_arr(std::move(scArr));
         }
         Json::array_t bmArr;
-        for (const auto& b : bearerMethodsSupported) bmArr.emplace_back(b);
+        for (const auto &b : bearerMethodsSupported)
+            bmArr.emplace_back(b);
         j["bearer_methods_supported"] = json_arr(std::move(bmArr));
 
-        if (!resourceName.empty()) j["resource_name"] = resourceName;
-        if (!resourceDocumentation.empty()) j["resource_documentation"] = resourceDocumentation;
+        if (!resourceName.empty())
+            j["resource_name"] = resourceName;
+        if (!resourceDocumentation.empty())
+            j["resource_documentation"] = resourceDocumentation;
         return j;
     }
 };
@@ -189,7 +198,7 @@ struct OAuthResourceMetadata {
 struct TokenValidationContext {
     std::string_view token;
     std::string_view expectedResource;
-    const HttpRouteRequest& request;
+    const HttpRouteRequest &request;
 };
 
 struct TokenValidationResult {
@@ -206,7 +215,7 @@ struct TokenValidationResult {
     std::vector<std::string> requiredScopes;
 };
 
-using TokenValidatorFn = std::function<TokenValidationResult(const TokenValidationContext&)>;
+using TokenValidatorFn = std::function<TokenValidationResult(const TokenValidationContext &)>;
 
 /** Standard MCP OAuth 2.0 resource-server configuration (RFC 9728 + RFC 6750 Bearer). */
 struct OAuthResourceConfig {
@@ -222,16 +231,23 @@ struct OAuthResourceConfig {
 namespace mcp_detail {
 
 inline std::optional<std::string> extract_bearer_token(std::string_view authHeader) {
-    while (!authHeader.empty() && authHeader.front() == ' ') authHeader.remove_prefix(1);
-    while (!authHeader.empty() && authHeader.back() == ' ') authHeader.remove_suffix(1);
-    if (authHeader.size() < 8) return std::nullopt;
+    while (!authHeader.empty() && authHeader.front() == ' ')
+        authHeader.remove_prefix(1);
+    while (!authHeader.empty() && authHeader.back() == ' ')
+        authHeader.remove_suffix(1);
+    if (authHeader.size() < 8)
+        return std::nullopt;
     std::string prefix = ascii_lower(authHeader.substr(0, 7));
-    if (prefix != "bearer ") return std::nullopt;
+    if (prefix != "bearer ")
+        return std::nullopt;
     std::string_view tok = authHeader.substr(7);
-    while (!tok.empty() && tok.front() == ' ') tok.remove_prefix(1);
-    if (tok.empty()) return std::nullopt;
+    while (!tok.empty() && tok.front() == ' ')
+        tok.remove_prefix(1);
+    if (tok.empty())
+        return std::nullopt;
     for (unsigned char c : tok) {
-        if (c < 0x21 || c > 0x7E) return std::nullopt;
+        if (c < 0x21 || c > 0x7E)
+            return std::nullopt;
     }
     return std::string(tok);
 }
@@ -241,8 +257,10 @@ inline std::string quote_header_param(std::string_view val) {
     out.reserve(val.size() + 2);
     out.push_back('"');
     for (char c : val) {
-        if (c == '"' || c == '\\') out.push_back('\\');
-        if (c != '\r' && c != '\n') out.push_back(c);
+        if (c == '"' || c == '\\')
+            out.push_back('\\');
+        if (c != '\r' && c != '\n')
+            out.push_back(c);
     }
     out.push_back('"');
     return out;
@@ -255,15 +273,18 @@ inline std::string build_www_authenticate(std::string_view resourceMetadataUrl,
     std::string h = "Bearer ";
     bool first = true;
     auto addField = [&](std::string_view k, std::string_view v) {
-        if (v.empty()) return;
-        if (!first) h += ", ";
+        if (v.empty())
+            return;
+        if (!first)
+            h += ", ";
         first = false;
         h += k;
         h.push_back('=');
         h += quote_header_param(v);
     };
     addField("resource_metadata", resourceMetadataUrl);
-    if (!error.empty()) addField("error", error);
+    if (!error.empty())
+        addField("error", error);
     if (!scopes.empty()) {
         std::vector<std::string> tmp(scopes.begin(), scopes.end());
         addField("scope", join_scopes(tmp));
@@ -275,9 +296,9 @@ inline std::string build_www_authenticate(std::string_view resourceMetadataUrl,
 }
 
 /** Fail-closed token validation enforcing issuer, audience/resource, expiry, and default scopes. */
-inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig& cfg,
+inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig &cfg,
                                                   std::string_view expectedResource,
-                                                  const HttpRouteRequest& req) {
+                                                  const HttpRouteRequest &req) {
     TokenValidationResult fail;
     fail.status = TokenValidationResult::Status::InvalidToken;
 
@@ -313,7 +334,7 @@ inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig& cfg
             .expectedResource = expectedResource,
             .request = req,
         });
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         fail.status = TokenValidationResult::Status::ServiceUnavailable;
         fail.errorDescription = "Token validator failed: " + redact_sensitive(e.what());
         return fail;
@@ -326,8 +347,8 @@ inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig& cfg
     if (res.status != TokenValidationResult::Status::Valid) {
         if (res.errorDescription.empty()) {
             res.errorDescription = res.status == TokenValidationResult::Status::InsufficientScope
-                ? "Insufficient scope"
-                : "Invalid or expired token";
+                                       ? "Insufficient scope"
+                                       : "Invalid or expired token";
         } else {
             res.errorDescription = redact_sensitive(res.errorDescription);
         }
@@ -347,7 +368,7 @@ inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig& cfg
 
     if (!cfg.expectedIssuers.empty()) {
         bool issuerOk = false;
-        for (const auto& iss : cfg.expectedIssuers) {
+        for (const auto &iss : cfg.expectedIssuers) {
             if (res.principal.issuer == iss) {
                 issuerOk = true;
                 break;
@@ -367,7 +388,7 @@ inline TokenValidationResult evaluate_bearer_auth(const OAuthResourceConfig& cfg
 
     // Check configured default scopes before accepting request.
     std::vector<std::string> missing;
-    for (const auto& reqScope : cfg.defaultScopes) {
+    for (const auto &reqScope : cfg.defaultScopes) {
         if (!res.principal.hasScope(reqScope)) {
             missing.push_back(reqScope);
         }

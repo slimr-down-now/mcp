@@ -65,10 +65,9 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
             .mimeType = "text/plain",
             .load = []() { return "Hello from resource!"; },
             .ttlMs = 60000,
-            .cacheScope = "public"
-        });
+            .cacheScope = "public"});
 
-        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput& in) {
+        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
             Json res = json_obj();
             res["sum"] = in.a.get() + in.b.get();
             return res;
@@ -78,7 +77,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         Json discoverResp = app.dispatchMcpJson(make_req(1, "server/discover"));
         CHECK(discoverResp["jsonrpc"].get<std::string>() == "2.0");
         CHECK(discoverResp["id"].get<int64_t>() == 1);
-        const Json& dr = discoverResp["result"];
+        const Json &dr = discoverResp["result"];
         CHECK(dr["resultType"].get<std::string>() == "complete");
         CHECK(dr["supportedVersions"].get_array().size() == 1);
         CHECK(dr["supportedVersions"][0].get<std::string>() == "2026-07-28");
@@ -92,7 +91,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
         // tools/list (must include 'add', 'mcp_resource_read', resultType, and CacheableResult hints)
         Json listResp = app.dispatchMcpJson(make_req(2, "tools/list"));
-        const Json& lr = listResp["result"];
+        const Json &lr = listResp["result"];
         CHECK(lr["resultType"].get<std::string>() == "complete");
         CHECK(lr["ttlMs"].get<int64_t>() >= 0);
         CHECK(lr["cacheScope"].get<std::string>() == "public");
@@ -101,10 +100,12 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
         bool foundAdd = false;
         bool foundResourceRead = false;
-        for (const auto& t : tools) {
+        for (const auto &t : tools) {
             std::string tName = t["name"].get<std::string>();
-            if (tName == "add") foundAdd = true;
-            if (tName == "mcp_resource_read") foundResourceRead = true;
+            if (tName == "add")
+                foundAdd = true;
+            if (tName == "mcp_resource_read")
+                foundResourceRead = true;
         }
         CHECK(foundAdd);
         CHECK(foundResourceRead);
@@ -161,15 +162,15 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
     TEST_CASE("tools/call: moved PluginApp safety, media blocks, errors, and unknown tool") {
         auto buildApp = []() {
             PluginApp local("moved-app", "1.0.0");
-            local.tool<AddInput>("add", "Adds two numbers", [](const AddInput& in) {
+            local.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
                 Json res = json_obj();
                 res["sum"] = in.a.get() + in.b.get();
                 return res;
             });
-            local.tool<std::monostate>("get_image", "Returns a mock image block", [](const std::monostate&) {
+            local.tool<std::monostate>("get_image", "Returns a mock image block", [](const std::monostate &) {
                 return McpResult::image("iVBORw0KGgoAAAANSUhEUg==", "image/png");
             });
-            local.tool<std::monostate>("fail_tool", "Throws a runtime error", [](const std::monostate&) -> McpResult {
+            local.tool<std::monostate>("fail_tool", "Throws a runtime error", [](const std::monostate &) -> McpResult {
                 throw std::runtime_error("Boom with Bearer super-secret-token");
             });
             return local;
@@ -220,8 +221,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
             .mimeType = "text/markdown",
             .load = []() { return "# Intro Header"; },
             .ttlMs = 30000,
-            .cacheScope = "private"
-        });
+            .cacheScope = "private"});
 
         Json listResp = app.dispatchMcpJson(make_req(20, "resources/list"));
         CHECK(listResp["result"]["resultType"].get<std::string>() == "complete");
@@ -256,9 +256,8 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
             "Returns caller principal",
             ToolOptions{
                 .annotations = ToolAnnotations{.readOnlyHint = true},
-                .requiredScopes = {"profile:read"}
-            },
-            [](const std::monostate&, const RequestContext& ctx) {
+                .requiredScopes = {"profile:read"}},
+            [](const std::monostate &, const RequestContext &ctx) {
                 Json j = json_obj();
                 j["subject"] = ctx.principal.subject;
                 j["version"] = ctx.protocolVersion;
@@ -268,7 +267,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         app.tool<std::monostate>(
             "needs_elicit",
             "Demonstrates MRTR and client capability enforcement",
-            [](const std::monostate&, const RequestContext& ctx) -> McpResult {
+            [](const std::monostate &, const RequestContext &ctx) -> McpResult {
                 ctx.requireClientCapability("elicitation");
                 if (!ctx.inputResponses.has_value()) {
                     Json reqs = json_obj();
@@ -335,7 +334,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
             "work",
             "Long operation observing progress/logs/cancellation",
             ToolOptions{.threadSafe = true},
-            [&](const std::monostate&, const RequestContext& ctx) {
+            [&](const std::monostate &, const RequestContext &ctx) {
                 ctx.emitProgress(1, 2, "halfway");
                 ctx.emitLog("debug", Json("should be suppressed at info"), "test");
                 ctx.emitLog("warning", Json("token=my-secret-123"), "test");
@@ -356,7 +355,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
         // 1) Normal run with progressToken + logLevel=warning + quick request (test without sleep if fast? Run quick cancel test separately)
         // Here test quick complete request + redaction via another tool:
-        app.tool<SecretInput>("echo_sec", "Logs and returns", [](const SecretInput& in, const RequestContext& ctx) {
+        app.tool<SecretInput>("echo_sec", "Logs and returns", [](const SecretInput &in, const RequestContext &ctx) {
             ctx.emitProgress(1, 1, "done");
             ctx.emitLog("debug", Json("hidden debug"), "unit");
             ctx.emitLog("error", Json("Bearer abcdef123456"), "unit");
@@ -405,13 +404,15 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
             int_type underflow() override {
                 std::unique_lock lk(mu);
                 cv.wait(lk, [&]() { return !buf.empty() || closed; });
-                if (buf.empty()) return traits_type::eof();
+                if (buf.empty())
+                    return traits_type::eof();
                 return traits_type::to_int_type(buf.front());
             }
             int_type uflow() override {
                 std::unique_lock lk(mu);
                 cv.wait(lk, [&]() { return !buf.empty() || closed; });
-                if (buf.empty()) return traits_type::eof();
+                if (buf.empty())
+                    return traits_type::eof();
                 char c = buf.front();
                 buf.erase(buf.begin());
                 return traits_type::to_int_type(c);
@@ -452,7 +453,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
     TEST_CASE("CLI direct invocation and redaction helper") {
         PluginApp app("cli-app");
-        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput& in) {
+        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
             Json res = json_obj();
             res["result"] = in.a.get() + in.b.get();
             return res;
@@ -461,10 +462,10 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         char arg0[] = "cli-app";
         char arg1[] = "add";
         char arg2[] = "{\"a\":15,\"b\":27}";
-        char* argv[] = {arg0, arg1, arg2, nullptr};
+        char *argv[] = {arg0, arg1, arg2, nullptr};
 
         std::stringstream ss;
-        auto* oldBuf = std::cout.rdbuf(ss.rdbuf());
+        auto *oldBuf = std::cout.rdbuf(ss.rdbuf());
         int code = app.run(3, argv);
         std::cout.rdbuf(oldBuf);
 
@@ -494,11 +495,15 @@ struct TcpFd {
     int fd{-1};
     TcpFd() = default;
     explicit TcpFd(int f) : fd(f) {}
-    TcpFd(const TcpFd&) = delete;
-    TcpFd& operator=(const TcpFd&) = delete;
-    TcpFd(TcpFd&& o) noexcept : fd(o.fd) { o.fd = -1; }
-    TcpFd& operator=(TcpFd&& o) noexcept {
-        if (this != &o) { reset(); fd = o.fd; o.fd = -1; }
+    TcpFd(const TcpFd &) = delete;
+    TcpFd &operator=(const TcpFd &) = delete;
+    TcpFd(TcpFd &&o) noexcept : fd(o.fd) { o.fd = -1; }
+    TcpFd &operator=(TcpFd &&o) noexcept {
+        if (this != &o) {
+            reset();
+            fd = o.fd;
+            o.fd = -1;
+        }
         return *this;
     }
     ~TcpFd() { reset(); }
@@ -518,7 +523,8 @@ struct RawHttpReply {
 
 TcpFd connect_loopback(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return TcpFd{};
+    if (fd < 0)
+        return TcpFd{};
     struct timeval tv{};
     tv.tv_sec = 5;
     tv.tv_usec = 0;
@@ -529,7 +535,7 @@ TcpFd connect_loopback(uint16_t port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
         ::close(fd);
         return TcpFd{};
     }
@@ -540,7 +546,8 @@ bool send_all(int fd, std::string_view data) {
     size_t sent = 0;
     while (sent < data.size()) {
         ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
-        if (n <= 0) return false;
+        if (n <= 0)
+            return false;
         sent += static_cast<size_t>(n);
     }
     return true;
@@ -549,20 +556,24 @@ bool send_all(int fd, std::string_view data) {
 std::string build_http_request(std::string_view method,
                                std::string_view path,
                                uint16_t port,
-                               const std::vector<std::pair<std::string, std::string>>& headers,
+                               const std::vector<std::pair<std::string, std::string>> &headers,
                                std::string_view body) {
     std::ostringstream os;
     os << method << " " << path << " HTTP/1.1\r\n";
     bool hasHost = false;
     bool hasConn = false;
-    for (const auto& [k, v] : headers) {
+    for (const auto &[k, v] : headers) {
         std::string kl = mcp_detail::ascii_lower(k);
-        if (kl == "host") hasHost = true;
-        if (kl == "connection") hasConn = true;
+        if (kl == "host")
+            hasHost = true;
+        if (kl == "connection")
+            hasConn = true;
     }
-    if (!hasHost) os << "Host: 127.0.0.1:" << port << "\r\n";
-    if (!hasConn) os << "Connection: close\r\n";
-    for (const auto& [k, v] : headers) {
+    if (!hasHost)
+        os << "Host: 127.0.0.1:" << port << "\r\n";
+    if (!hasConn)
+        os << "Connection: close\r\n";
+    for (const auto &[k, v] : headers) {
         os << k << ": " << v << "\r\n";
     }
     if (!body.empty() || method == "POST" || method == "PUT") {
@@ -593,10 +604,12 @@ RawHttpReply parse_http_reply(std::string_view raw) {
         if (col != std::string_view::npos) {
             std::string k = mcp_detail::ascii_lower(line.substr(0, col));
             std::string_view v = line.substr(col + 1);
-            while (!v.empty() && v.front() == ' ') v.remove_prefix(1);
+            while (!v.empty() && v.front() == ' ')
+                v.remove_prefix(1);
             reply.headers[k] = std::string(v);
         }
-        if (next == std::string_view::npos) break;
+        if (next == std::string_view::npos)
+            break;
         pos = next + 2;
     }
 
@@ -606,13 +619,16 @@ RawHttpReply parse_http_reply(std::string_view raw) {
         size_t p = 0;
         while (p < bodyPart.size()) {
             auto crlf = bodyPart.find("\r\n", p);
-            if (crlf == std::string_view::npos) break;
+            if (crlf == std::string_view::npos)
+                break;
             std::string szHex(bodyPart.substr(p, crlf - p));
             auto semi = szHex.find(';');
-            if (semi != std::string::npos) szHex.resize(semi);
+            if (semi != std::string::npos)
+                szHex.resize(semi);
             size_t chunkLen = std::strtoull(szHex.c_str(), nullptr, 16);
             p = crlf + 2;
-            if (chunkLen == 0) break;
+            if (chunkLen == 0)
+                break;
             if (p + chunkLen > bodyPart.size()) {
                 decoded.append(bodyPart.substr(p));
                 break;
@@ -630,17 +646,20 @@ RawHttpReply parse_http_reply(std::string_view raw) {
 RawHttpReply http_exchange(uint16_t port,
                            std::string_view method,
                            std::string_view path,
-                           const std::vector<std::pair<std::string, std::string>>& headers,
+                           const std::vector<std::pair<std::string, std::string>> &headers,
                            std::string_view body) {
     TcpFd fd = connect_loopback(port);
-    if (fd.fd < 0) return {};
+    if (fd.fd < 0)
+        return {};
     std::string rawReq = build_http_request(method, path, port, headers, body);
-    if (!send_all(fd.fd, rawReq)) return {};
+    if (!send_all(fd.fd, rawReq))
+        return {};
     std::string rawResp;
     char buf[4096];
     for (;;) {
         ssize_t n = ::recv(fd.fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         rawResp.append(buf, static_cast<size_t>(n));
     }
     return parse_http_reply(rawResp);
@@ -651,18 +670,24 @@ std::string read_http_message(int fd) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (std::chrono::steady_clock::now() < deadline) {
         pollfd pfd{fd, POLLIN, 0};
-        if (::poll(&pfd, 1, 50) < 0) break;
-        if (!(pfd.revents & (POLLIN | POLLHUP))) continue;
+        if (::poll(&pfd, 1, 50) < 0)
+            break;
+        if (!(pfd.revents & (POLLIN | POLLHUP)))
+            continue;
         char buf[8192];
         const auto n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0)
+            break;
         raw.append(buf, static_cast<size_t>(n));
-        if (raw.find("\r\n\r\n") == std::string::npos) continue;
+        if (raw.find("\r\n\r\n") == std::string::npos)
+            continue;
         const auto reply = parse_http_reply(raw);
         if (reply.headers.contains("transfer-encoding")) {
-            if (raw.ends_with("\r\n0\r\n\r\n")) break;
+            if (raw.ends_with("\r\n0\r\n\r\n"))
+                break;
         } else if (auto it = reply.headers.find("content-length"); it != reply.headers.end()) {
-            if (reply.body.size() == std::stoull(it->second)) break;
+            if (reply.body.size() == std::stoull(it->second))
+                break;
         }
     }
     return raw;
@@ -678,8 +703,10 @@ std::vector<std::pair<std::string, std::string>> mcp_headers(
         {"MCP-Protocol-Version", "2026-07-28"},
         {"Mcp-Method", std::string(method)},
     };
-    if (!mcpName.empty()) h.emplace_back("Mcp-Name", std::string(mcpName));
-    if (!bearer.empty()) h.emplace_back("Authorization", "Bearer " + std::string(bearer));
+    if (!mcpName.empty())
+        h.emplace_back("Mcp-Name", std::string(mcpName));
+    if (!bearer.empty())
+        h.emplace_back("Authorization", "Bearer " + std::string(bearer));
     return h;
 }
 
@@ -689,7 +716,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
     TEST_CASE("Streamable HTTP bind validation, discovery, headers, x-mcp-header, and Base64 sentinel") {
         PluginApp app("http-app", "3.1.0");
         app.instructions = "HTTP test app";
-        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput& in) {
+        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
             Json j = json_obj();
             j["sum"] = in.a.get() + in.b.get();
             return j;
@@ -708,12 +735,12 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "required": ["region"],
             "additionalProperties": false
         })");
-        hdrTool.handler = [](const Json& args, const RequestContext&) {
+        hdrTool.handler = [](const Json &args, const RequestContext &) {
             return McpResult::text(args["region"].get<std::string>());
         };
         app.registerTool(std::move(hdrTool));
 
-        app.tool<std::monostate>("UTF8_☕", "Unicode tool", [](const std::monostate&) {
+        app.tool<std::monostate>("UTF8_☕", "Unicode tool", [](const std::monostate &) {
             return "coffee";
         });
 
@@ -867,7 +894,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "stream_steps",
             "Emits incremental SSE before second step",
             ToolOptions{.threadSafe = true},
-            [&](const std::monostate&, const RequestContext& ctx) {
+            [&](const std::monostate &, const RequestContext &ctx) {
                 ctx.emitProgress(1, 2, "step-one");
                 {
                     std::lock_guard lk(stepMu);
@@ -888,13 +915,14 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "wait_cancel",
             "Waits until cancelled or released",
             ToolOptions{.threadSafe = true},
-            [&](const std::monostate&, const RequestContext& ctx) {
+            [&](const std::monostate &, const RequestContext &ctx) {
                 for (int i = 0; i < 400; ++i) {
                     if (ctx.cancellation.isCancelled()) {
                         blockCancelled.store(true);
                         return "cancelled";
                     }
-                    if (releaseWorkers.load()) return "released";
+                    if (releaseWorkers.load())
+                        return "released";
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 return "timeout";
@@ -904,10 +932,11 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "flood",
             "Produces many progress events to verify bounded SSE buffer on slow reader",
             ToolOptions{.threadSafe = true},
-            [&](const std::monostate&, const RequestContext& ctx) {
+            [&](const std::monostate &, const RequestContext &ctx) {
                 std::string pad(2048, 'x');
                 for (int i = 0; i < 120; ++i) {
-                    if (ctx.cancellation.isCancelled()) break;
+                    if (ctx.cancellation.isCancelled())
+                        break;
                     ctx.emitProgress(i + 1, 120, pad);
                 }
                 return "flood-done";
@@ -948,8 +977,10 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
                 struct pollfd pfd{fd.fd, POLLIN, 0};
                 if (::poll(&pfd, 1, 50) > 0) {
                     ssize_t n = ::recv(fd.fd, buf, sizeof(buf), 0);
-                    if (n > 0) soFar.append(buf, static_cast<size_t>(n));
-                    if (soFar.find("step-one") != std::string::npos) break;
+                    if (n > 0)
+                        soFar.append(buf, static_cast<size_t>(n));
+                    if (soFar.find("step-one") != std::string::npos)
+                        break;
                 }
             }
             CHECK(soFar.find("text/event-stream") != std::string::npos);
@@ -964,7 +995,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
 
             for (;;) {
                 ssize_t n = ::recv(fd.fd, buf, sizeof(buf), 0);
-                if (n <= 0) break;
+                if (n <= 0)
+                    break;
                 soFar.append(buf, static_cast<size_t>(n));
             }
             CHECK(soFar.find("step-two") != std::string::npos);
@@ -1023,14 +1055,14 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "public_read",
             "Requires mcp:read",
             ToolOptions{.requiredScopes = {"mcp:read"}},
-            [](const std::monostate&, const RequestContext& ctx) {
+            [](const std::monostate &, const RequestContext &ctx) {
                 return "sub=" + ctx.principal.subject;
             });
         app.tool<std::monostate>(
             "admin_write",
             "Requires mcp:write",
             ToolOptions{.requiredScopes = {"mcp:write"}},
-            [](const std::monostate&) {
+            [](const std::monostate &) {
                 return "admin-ok";
             });
 
@@ -1049,7 +1081,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         opts.oauth.metadata.scopesSupported = {"mcp:read", "mcp:write"};
         opts.oauth.metadata.authorizationServers = {"https://auth.example.test"};
 
-        opts.oauth.validateToken = [&](const TokenValidationContext& tctx) {
+        opts.oauth.validateToken = [&](const TokenValidationContext &tctx) {
             std::lock_guard lk(authMu);
             TokenValidationResult res;
             auto it = activeTokens.find(std::string(tctx.token));
@@ -1066,17 +1098,16 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         opts.customRoutes.push_back(CustomHttpRoute{
             .method = "GET",
             .path = "/test-as/authorize",
-            .handler = [&](const HttpRouteRequest& req) {
+            .handler = [&](const HttpRouteRequest &req) {
                 std::lock_guard lk(authMu);
                 std::string code = "code-123";
                 issuedCodes[code] = req.query("client_id").value_or("opencode");
                 return HttpRouteResponse::json(200, *parse_json<Json>("{\"code\":\"code-123\"}"));
-            }
-        });
+            }});
         opts.customRoutes.push_back(CustomHttpRoute{
             .method = "POST",
             .path = "/test-as/token",
-            .handler = [&](const HttpRouteRequest& req) {
+            .handler = [&](const HttpRouteRequest &req) {
                 std::lock_guard lk(authMu);
                 auto parsed = parse_json<Json>(req.body);
                 if (!parsed || !parsed->contains("code") ||
@@ -1097,8 +1128,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
                 out["token_type"] = "Bearer";
                 out["scope"] = "mcp:read";
                 return HttpRouteResponse::json(200, out);
-            }
-        });
+            }});
 
         McpHttpServer srv(app, opts);
         REQUIRE(srv.start());
@@ -1177,11 +1207,14 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             activeTokens["tok-wrong-aud"] = wrongAud;
         }
         CHECK(http_exchange(port, "POST", "/mcp", mcp_headers("server/discover", "", "tok-expired"),
-                            slimr::write_json(make_req(5, "server/discover"))).status == 401);
+                            slimr::write_json(make_req(5, "server/discover")))
+                  .status == 401);
         CHECK(http_exchange(port, "POST", "/mcp", mcp_headers("server/discover", "", "tok-wrong-iss"),
-                            slimr::write_json(make_req(6, "server/discover"))).status == 401);
+                            slimr::write_json(make_req(6, "server/discover")))
+                  .status == 401);
         CHECK(http_exchange(port, "POST", "/mcp", mcp_headers("server/discover", "", "tok-wrong-aud"),
-                            slimr::write_json(make_req(7, "server/discover"))).status == 401);
+                            slimr::write_json(make_req(7, "server/discover")))
+                  .status == 401);
 
         srv.stop();
     }
@@ -1196,8 +1229,9 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             const std::string payload(256 * 1024, 'x');
             app.tool<std::monostate>(
                 "finish", "Completes during shutdown", ToolOptions{.threadSafe = true},
-                [&](const std::monostate&, const RequestContext& ctx) {
-                    if (stream) ctx.emitProgress(1, 2, "started");
+                [&](const std::monostate &, const RequestContext &ctx) {
+                    if (stream)
+                        ctx.emitProgress(1, 2, "started");
                     started.store(true);
                     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
                     while (!release.load() && std::chrono::steady_clock::now() < deadline) {
@@ -1231,9 +1265,10 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             params["name"] = "finish";
             params["arguments"] = json_obj();
             auto req = make_req(42, "tools/call", params);
-            if (stream) req["params"]["_meta"]["progressToken"] = "natural-stop";
+            if (stream)
+                req["params"]["_meta"]["progressToken"] = "natural-stop";
             REQUIRE(send_all(conn.fd, build_http_request(
-                "POST", "/mcp", port, mcp_headers("tools/call", "finish"), slimr::write_json(req))));
+                                          "POST", "/mcp", port, mcp_headers("tools/call", "finish"), slimr::write_json(req))));
             for (int i = 0; i < 1000 && !started.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
@@ -1243,16 +1278,19 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             int admissionStatus = 0;
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             while (std::chrono::steady_clock::now() < deadline) {
-                if (!send_all(probe.fd, discovery)) break;
+                if (!send_all(probe.fd, discovery))
+                    break;
                 admissionStatus = parse_http_reply(read_http_message(probe.fd)).status;
-                if (admissionStatus != 200) break;
+                if (admissionStatus != 200)
+                    break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             CHECK(admissionStatus == 503);
             TcpFd refused;
             do {
                 refused = connect_loopback(port);
-                if (refused.fd < 0) break;
+                if (refused.fd < 0)
+                    break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             } while (std::chrono::steady_clock::now() < deadline);
             CHECK(refused.fd < 0);
@@ -1282,7 +1320,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             srv.stop();
             REQUIRE(srv.start(&err));
             CHECK(http_exchange(srv.boundPort(), "POST", "/mcp", mcp_headers("server/discover"),
-                                slimr::write_json(make_req(2, "server/discover"))).status == 200);
+                                slimr::write_json(make_req(2, "server/discover")))
+                      .status == 200);
             srv.stop();
         }
     }
@@ -1291,7 +1330,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         PluginApp app("slow-shutdown");
         const std::string payload(8 * 1024 * 1024, 'x');
         app.tool<std::monostate>("large", "Produces a buffered response",
-                                [&](const std::monostate&) { return payload; });
+                                 [&](const std::monostate &) { return payload; });
         HttpServerOptions opts;
         opts.allowEphemeralPort = true;
         opts.shutdownTimeoutMs = 0;
@@ -1307,8 +1346,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         params["name"] = "large";
         params["arguments"] = json_obj();
         REQUIRE(send_all(conn.fd, build_http_request(
-            "POST", "/mcp", srv.boundPort(), mcp_headers("tools/call", "large"),
-            slimr::write_json(make_req(1, "tools/call", params)))));
+                                      "POST", "/mcp", srv.boundPort(), mcp_headers("tools/call", "large"),
+                                      slimr::write_json(make_req(1, "tools/call", params)))));
         pollfd ready{conn.fd, POLLIN, 0};
         REQUIRE(::poll(&ready, 1, 3000) > 0);
         char header[128]{};
@@ -1328,11 +1367,13 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             PluginApp cliApp("cli-http", "1.0.0");
             enable_http(cliApp, HttpServerOptions{.port = 0, .allowEphemeralPort = true});
 
-            auto run_args = [&](std::initializer_list<const char*> args) {
+            auto run_args = [&](std::initializer_list<const char *> args) {
                 std::vector<std::string> storage;
-                std::vector<char*> argv;
-                for (const char* s : args) storage.emplace_back(s);
-                for (auto& s : storage) argv.push_back(s.data());
+                std::vector<char *> argv;
+                for (const char *s : args)
+                    storage.emplace_back(s);
+                for (auto &s : storage)
+                    argv.push_back(s.data());
                 return cliApp.run(static_cast<int>(argv.size()), argv.data());
             };
 
@@ -1352,7 +1393,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             "hang_stream",
             "Emits one progress event then waits until cancelled",
             ToolOptions{.threadSafe = true},
-            [&](const std::monostate&, const RequestContext& ctx) {
+            [&](const std::monostate &, const RequestContext &ctx) {
                 ctx.emitProgress(1, 2, "started");
                 started.store(true);
                 while (!ctx.cancellation.isCancelled()) {
@@ -1363,7 +1404,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             });
         app.tool<std::monostate>(
             "queued", "Must not run after the shutdown deadline", ToolOptions{.threadSafe = true},
-            [&](const std::monostate&) {
+            [&](const std::monostate &) {
                 queuedCalls.fetch_add(1);
                 return "unexpected";
             });
