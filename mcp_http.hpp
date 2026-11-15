@@ -38,14 +38,10 @@
 namespace slimr {
 
 struct HttpServerOptions {
-    std::string host{"127.0.0.1"};
+    std::string host{"0.0.0.0"};
     int port{0};
-    bool allowEphemeralPort{false};
-    bool allowNonLoopback{false};
     std::string mcpPath{"/mcp"};
     std::string publicBaseUrl;
-    std::vector<std::string> allowedOrigins;
-    std::vector<std::string> allowedHosts;
     size_t maxRequestBytes{4 * 1024 * 1024};
     uint32_t maxConnections{64};
     size_t workerThreads{4};
@@ -71,7 +67,7 @@ struct HttpListenSocket {
     }
 };
 
-inline bool is_valid_ip_literal(std::string_view host, bool *isIpv6 = nullptr, bool *isLoopback = nullptr) {
+inline bool is_valid_ip_literal(std::string_view host, bool *isIpv6 = nullptr) {
     if (host.empty() || host.size() >= 64)
         return false;
     std::string tmp(host);
@@ -79,19 +75,12 @@ inline bool is_valid_ip_literal(std::string_view host, bool *isIpv6 = nullptr, b
     if (inet_pton(AF_INET, tmp.c_str(), &v4) == 1) {
         if (isIpv6)
             *isIpv6 = false;
-        if (isLoopback) {
-            uint32_t addr = ntohl(v4.s_addr);
-            *isLoopback = ((addr >> 24U) == 127U);
-        }
         return true;
     }
     struct in6_addr v6{};
     if (inet_pton(AF_INET6, tmp.c_str(), &v6) == 1) {
         if (isIpv6)
             *isIpv6 = true;
-        if (isLoopback) {
-            *isLoopback = IN6_IS_ADDR_LOOPBACK(&v6);
-        }
         return true;
     }
     return false;
@@ -223,40 +212,6 @@ inline bool header_matches_json_param(std::string_view decodedHeader,
     return false;
 }
 
-inline std::optional<std::string> normalize_origin(std::string_view origin) {
-    auto schemeEnd = origin.find("://");
-    if (schemeEnd == std::string_view::npos)
-        return std::nullopt;
-    std::string scheme = ascii_lower(origin.substr(0, schemeEnd));
-    if (scheme != "http" && scheme != "https")
-        return std::nullopt;
-    std::string_view rest = origin.substr(schemeEnd + 3);
-    if (rest.empty() || rest.find('/') != std::string_view::npos ||
-        rest.find('?') != std::string_view::npos ||
-        rest.find('#') != std::string_view::npos) {
-        return std::nullopt;
-    }
-    return scheme + "://" + ascii_lower(rest);
-}
-
-inline std::string extract_url_origin(std::string_view url) {
-    auto schemeEnd = url.find("://");
-    if (schemeEnd == std::string_view::npos)
-        return "";
-    auto slash = url.find('/', schemeEnd + 3);
-    std::string_view originPart = slash == std::string_view::npos ? url : url.substr(0, slash);
-    return ascii_lower(originPart);
-}
-
-inline std::string extract_url_host(std::string_view url) {
-    auto schemeEnd = url.find("://");
-    if (schemeEnd == std::string_view::npos)
-        return "";
-    auto rest = url.substr(schemeEnd + 3);
-    auto slash = rest.find('/');
-    return ascii_lower(slash == std::string_view::npos ? rest : rest.substr(0, slash));
-}
-
 inline std::map<std::string, std::string> parse_query_params(std::string_view rawUrl) {
     std::map<std::string, std::string> out;
     auto qpos = rawUrl.find('?');
@@ -357,24 +312,15 @@ class McpHttpServer {
             return true;
         }
         bool isV6 = false;
-        bool isLoopback = false;
-        if (!mcp_detail::is_valid_ip_literal(opts_.host, &isV6, &isLoopback)) {
+        if (!mcp_detail::is_valid_ip_literal(opts_.host, &isV6)) {
             if (errOut)
                 *errOut = "Invalid bind host IP literal: " + opts_.host;
             return false;
         }
-        if (!isLoopback && !opts_.allowNonLoopback) {
-            if (errOut)
-                *errOut = "Non-loopback bind host refused unless allowNonLoopback=true: " + opts_.host;
-            return false;
-        }
-        isLoopbackBind_ = isLoopback;
 
-        if (opts_.port < 0 || opts_.port > 65535 || (opts_.port == 0 && !opts_.allowEphemeralPort)) {
+        if (opts_.port < 0 || opts_.port > 65535) {
             if (errOut) {
-                *errOut = opts_.port == 0
-                              ? "Port 0 requires allowEphemeralPort=true (use an explicit fixed port 1-65535 for services)"
-                              : ("Invalid port: " + std::to_string(opts_.port));
+                *errOut = "Invalid port: " + std::to_string(opts_.port);
             }
             return false;
         }
@@ -432,8 +378,6 @@ class McpHttpServer {
         std::string metaSuffixed = metaPrimary + normalizedMcpPath();
         auto metaHandler = http_ctx_handler([this](const HttpContextPtr &c) -> int {
             try {
-                if (!validateOriginAndHost(c, true))
-                    return HTTP_STATUS_UNFINISHED;
                 Json doc = opts_.oauth.metadata.toJson(mcpEndpointUrl());
                 sendJsonText(c->writer, 200, slimr::write_json(doc));
             } catch (const std::exception &e) {
@@ -468,8 +412,6 @@ class McpHttpServer {
                            return HTTP_STATUS_UNFINISHED;
                        }));
         auto methodNotAllowed = http_ctx_handler([this](const HttpContextPtr &c) -> int {
-            if (!validateOriginAndHost(c, true))
-                return HTTP_STATUS_UNFINISHED;
             sendResponse(c->writer, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
                          {{"Allow", "POST"}});
             return HTTP_STATUS_UNFINISHED;
@@ -705,97 +647,11 @@ class McpHttpServer {
         return req;
     }
 
-    bool isHostAllowed(std::string_view hostHeader) const {
-        if (hostHeader.empty())
-            return true;
-        std::string lower = mcp_detail::ascii_lower(hostHeader);
-        for (const auto &allowed : opts_.allowedHosts) {
-            if (mcp_detail::ascii_lower(allowed) == lower)
-                return true;
-        }
-        if (!opts_.publicBaseUrl.empty()) {
-            std::string pubHost = mcp_detail::extract_url_host(opts_.publicBaseUrl);
-            if (!pubHost.empty() && pubHost == lower)
-                return true;
-        }
-        uint16_t p = boundPort();
-        std::string pSuffix = p > 0 ? (":" + std::to_string(p)) : "";
-        bool isV6 = false;
-        mcp_detail::is_valid_ip_literal(opts_.host, &isV6, nullptr);
-        std::string boundAuthority = mcp_detail::ascii_lower(mcp_detail::format_authority_host(opts_.host, isV6));
-        if (lower == boundAuthority || (!pSuffix.empty() && lower == boundAuthority + pSuffix)) {
-            return true;
-        }
-        if (isLoopbackBind_) {
-            if (lower == "localhost" || lower == "127.0.0.1" || lower == "[::1]")
-                return true;
-            if (!pSuffix.empty() &&
-                (lower == "localhost" + pSuffix || lower == "127.0.0.1" + pSuffix || lower == "[::1]" + pSuffix)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool isOriginAllowed(std::string_view originHeader) const {
-        if (originHeader == "null")
-            return false;
-        auto normOpt = mcp_detail::normalize_origin(originHeader);
-        if (!normOpt.has_value())
-            return false;
-        const std::string &norm = *normOpt;
-
-        for (const auto &allowed : opts_.allowedOrigins) {
-            auto aNorm = mcp_detail::normalize_origin(allowed);
-            if (aNorm.has_value() && *aNorm == norm)
-                return true;
-        }
-        if (!opts_.publicBaseUrl.empty() && mcp_detail::extract_url_origin(opts_.publicBaseUrl) == norm) {
-            return true;
-        }
-        uint16_t p = boundPort();
-        if (p > 0) {
-            bool isV6 = false;
-            mcp_detail::is_valid_ip_literal(opts_.host, &isV6, nullptr);
-            std::string auth = mcp_detail::ascii_lower(mcp_detail::format_authority_host(opts_.host, isV6));
-            std::string boundOrigin = "http://" + auth + ":" + std::to_string(p);
-            if (norm == boundOrigin)
-                return true;
-            if (isLoopbackBind_) {
-                if (norm == ("http://127.0.0.1:" + std::to_string(p)) ||
-                    norm == ("http://localhost:" + std::to_string(p)) ||
-                    norm == ("http://[::1]:" + std::to_string(p))) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    bool validateOriginAndHost(const HttpContextPtr &c, bool checkOrigin) const {
-        std::string hostHdr = c->header("Host");
-        if (!isHostAllowed(hostHdr)) {
-            sendJsonText(c->writer, 403, "{\"error\":\"forbidden\",\"error_description\":\"Invalid Host header\"}");
-            return false;
-        }
-        if (checkOrigin) {
-            std::string originHdr = c->header("Origin");
-            if (!originHdr.empty() && !isOriginAllowed(originHdr)) {
-                sendJsonText(c->writer, 403, "{\"error\":\"forbidden\",\"error_description\":\"Forbidden Origin\"}");
-                return false;
-            }
-        }
-        return true;
-    }
-
     void registerCustomRoute(const CustomHttpRoute &route) {
         if (!route.handler || route.path.empty())
             return;
         auto wrap = http_ctx_handler([this, route](const HttpContextPtr &c) -> int {
             try {
-                if (!validateOriginAndHost(c, route.enforceSameOrigin)) {
-                    return HTTP_STATUS_UNFINISHED;
-                }
                 if (c->body().size() > opts_.maxRequestBytes) {
                     sendJsonText(c->writer, 413, "{\"error\":\"payload_too_large\"}");
                     return HTTP_STATUS_UNFINISHED;
@@ -950,9 +806,6 @@ class McpHttpServer {
     }
 
     void handleMcpPost(const HttpContextPtr &c) {
-        if (!validateOriginAndHost(c, true))
-            return;
-
         if (!mcp_detail::is_json_content_type(c->header("Content-Type"))) {
             sendJsonText(c->writer, 415, "{\"error\":\"unsupported_media_type\"}");
             return;
@@ -1311,7 +1164,6 @@ class McpHttpServer {
 
     PluginApp &app_;
     HttpServerOptions opts_;
-    bool isLoopbackBind_{true};
     std::atomic<bool> running_{false};
     std::atomic<bool> draining_{false};
     std::atomic<uint16_t> boundPort_{0};
@@ -1323,7 +1175,7 @@ class McpHttpServer {
     std::vector<std::weak_ptr<hv::HttpResponseWriter>> responseWriters_;
 };
 
-/** Attaches standalone `http [--host <addr>] [--port <n>] [--allow-ephemeral-port]` subcommand to PluginApp. */
+/** Attaches standalone `http [--host <addr>] [--port <n>]` subcommand to PluginApp. */
 inline void enable_http(PluginApp &app, HttpServerOptions defaults = {}) {
     app.setHttpRunner([defaults = std::move(defaults)](PluginApp &target, int argc, char **argv) -> int {
         HttpServerOptions opts = defaults;
@@ -1340,12 +1192,10 @@ inline void enable_http(PluginApp &app, HttpServerOptions defaults = {}) {
                     return 2;
                 }
                 opts.port = static_cast<int>(parsedPort);
-            } else if (arg == "--allow-ephemeral-port") {
-                opts.allowEphemeralPort = true;
             } else {
                 std::cerr << "Unknown or incomplete HTTP option: " << arg << "\n";
                 std::cerr << "Usage: " << (target.key.empty() ? "app" : target.key)
-                          << " http [--host <addr>] [--port <n>] [--allow-ephemeral-port]\n";
+                          << " http [--host <addr>] [--port <n>]\n";
                 return 2;
             }
         }

@@ -754,26 +754,26 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             HttpServerOptions badOpts;
             badOpts.host = "not-an-ip";
             badOpts.port = 0;
-            badOpts.allowEphemeralPort = true;
             McpHttpServer badSrv(app, badOpts);
             std::string err;
             CHECK(badSrv.start(&err) == false);
             CHECK(err.find("Invalid bind host") != std::string::npos);
         }
-        // Port 0 rejected without allowEphemeralPort
+        // Default options bind 0.0.0.0:0 directly
         {
-            HttpServerOptions fixedOnly;
-            fixedOnly.host = "127.0.0.1";
-            fixedOnly.port = 0;
-            McpHttpServer badSrv(app, fixedOnly);
+            HttpServerOptions defOpts;
+            CHECK(defOpts.host == "0.0.0.0");
+            CHECK(defOpts.port == 0);
+            McpHttpServer defSrv(app, defOpts);
             std::string err;
-            CHECK(badSrv.start(&err) == false);
+            REQUIRE(defSrv.start(&err));
+            CHECK(defSrv.boundPort() > 0);
+            defSrv.stop();
         }
 
         HttpServerOptions opts;
         opts.host = "127.0.0.1";
         opts.port = 0;
-        opts.allowEphemeralPort = true;
         McpHttpServer srv(app, opts);
         std::string err;
         REQUIRE(srv.start(&err));
@@ -784,27 +784,31 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         auto getMcp = http_exchange(port, "GET", "/mcp", {}, "");
         CHECK(getMcp.status == 405);
 
-        // Invalid Origin -> 403 Forbidden
-        auto badOrigin = http_exchange(
+        // Arbitrary Origin -> 200 OK
+        auto anyOrigin = http_exchange(
             port, "POST", "/mcp",
             {
-                {"Origin", "https://evil.example"},
+                {"Origin", "https://any.example"},
                 {"Content-Type", "application/json"},
                 {"Accept", "application/json, text/event-stream"},
+                {"MCP-Protocol-Version", "2026-07-28"},
+                {"Mcp-Method", "server/discover"},
             },
             slimr::write_json(make_req(1, "server/discover")));
-        CHECK(badOrigin.status == 403);
+        CHECK(anyOrigin.status == 200);
 
-        // Invalid Host (DNS rebinding) -> 403 Forbidden
-        auto badHost = http_exchange(
+        // Arbitrary Host -> 200 OK
+        auto anyHost = http_exchange(
             port, "POST", "/mcp",
             {
-                {"Host", "evil.example:" + std::to_string(port)},
+                {"Host", "any.example:" + std::to_string(port)},
                 {"Content-Type", "application/json"},
                 {"Accept", "application/json, text/event-stream"},
+                {"MCP-Protocol-Version", "2026-07-28"},
+                {"Mcp-Method", "server/discover"},
             },
             slimr::write_json(make_req(1, "server/discover")));
-        CHECK(badHost.status == 403);
+        CHECK(anyHost.status == 200);
 
         // Missing Accept text/event-stream -> 406
         auto badAccept = http_exchange(
@@ -950,7 +954,6 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         HttpServerOptions opts;
         opts.host = "127.0.0.1";
         opts.port = 0;
-        opts.allowEphemeralPort = true;
         opts.workerThreads = 2;
         opts.maxPendingJobs = 2;
         opts.sseHighWaterBytes = 4096;
@@ -1079,7 +1082,6 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         HttpServerOptions opts;
         opts.host = "127.0.0.1";
         opts.port = 0;
-        opts.allowEphemeralPort = true;
         opts.oauth.enabled = true;
         opts.oauth.expectedIssuers = {"https://auth.example.test"};
         opts.oauth.defaultScopes = {"mcp:read"};
@@ -1246,7 +1248,6 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
                     return payload;
                 });
             HttpServerOptions opts;
-            opts.allowEphemeralPort = true;
             opts.shutdownTimeoutMs = 2000;
             opts.sseMaxWriteBufBytes = 1024 * 1024;
             McpHttpServer srv(app, opts);
@@ -1337,7 +1338,6 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         app.tool<std::monostate>("large", "Produces a buffered response",
                                  [&](const std::monostate &) { return payload; });
         HttpServerOptions opts;
-        opts.allowEphemeralPort = true;
         opts.shutdownTimeoutMs = 0;
         opts.sseMaxWriteBufBytes = 16 * 1024 * 1024;
         McpHttpServer srv(app, opts);
@@ -1370,7 +1370,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         // 1) CLI validation errors return non-zero cleanly
         {
             PluginApp cliApp("cli-http", "1.0.0");
-            enable_http(cliApp, HttpServerOptions{.port = 0, .allowEphemeralPort = true});
+            enable_http(cliApp, HttpServerOptions{.port = 0});
 
             auto run_args = [&](std::initializer_list<const char *> args) {
                 std::vector<std::string> storage;
@@ -1385,7 +1385,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             CHECK(run_args({"cli-http", "http", "--port", "not-a-number"}) == 2);
             CHECK(run_args({"cli-http", "http", "--port", "70000"}) == 2);
             CHECK(run_args({"cli-http", "http", "--unknown-flag"}) == 2);
-            CHECK(run_args({"cli-http", "http", "--host", "0.0.0.0"}) == 1);
+            CHECK(run_args({"cli-http", "http", "--allow-ephemeral-port"}) == 2);
+            CHECK(run_args({"cli-http", "http", "--host", "not-an-ip"}) == 1);
         }
 
         // 2) Graceful stop drains and cancels an open active SSE stream within shutdown timeout
@@ -1417,7 +1418,6 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         HttpServerOptions opts;
         opts.host = "127.0.0.1";
         opts.port = 0;
-        opts.allowEphemeralPort = true;
         opts.shutdownTimeoutMs = 200;
         opts.workerThreads = 1;
         opts.maxPendingJobs = 1;
