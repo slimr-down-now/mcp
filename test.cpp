@@ -478,12 +478,17 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         CHECK(red.find("state=ok") != std::string::npos);
     }
 
-    TEST_CASE("PluginApp setBugsink populates bugsinkDsn") {
+    TEST_CASE("PluginApp setBugsink populates bugsinkDsn and release") {
         PluginApp app("test-app", "1.0.0");
         CHECK(app.bugsinkDsn.empty());
         app.setBugsink("https://key@bugsink.example.com/1");
         CHECK(app.bugsinkDsn == "https://key@bugsink.example.com/1");
-        CHECK(app.bugsink() != nullptr);
+        REQUIRE(app.bugsink() != nullptr);
+        CHECK(app.bugsink()->release() == "test-app@1.0.0");
+
+        app.setBugsink("https://key@bugsink.example.com/1", "BUGSINK_DSN", "custom@2.0.0");
+        REQUIRE(app.bugsink() != nullptr);
+        CHECK(app.bugsink()->release() == "custom@2.0.0");
     }
 }
 

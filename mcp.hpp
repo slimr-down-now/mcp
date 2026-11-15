@@ -632,9 +632,12 @@ class PluginApp {
     explicit PluginApp(std::string appKey, std::string appVer = "1.0.0")
         : key(std::move(appKey)), version(std::move(appVer)), runtime_(std::make_shared<RuntimeState>()) {}
 
-    void setBugsink(std::string dsn, std::string envVar = "BUGSINK_DSN") {
+    void setBugsink(std::string dsn, std::string envVar = "BUGSINK_DSN", std::string release = "") {
         bugsinkDsn = dsn;
-        runtime_->bugsink = std::make_shared<BugsinkReporter>(std::move(dsn), std::move(envVar));
+        if (release.empty() && !key.empty() && !version.empty()) {
+            release = key + "@" + version;
+        }
+        runtime_->bugsink = std::make_shared<BugsinkReporter>(std::move(dsn), std::move(envVar), std::move(release));
     }
 
     BugsinkReporter *bugsink() const noexcept {
