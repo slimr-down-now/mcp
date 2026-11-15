@@ -610,6 +610,11 @@ struct CachePolicy {
     std::string resourcesListCacheScope{"public"};
 };
 
+struct RequiredEnvVar {
+    std::string name;
+    std::string purpose;
+};
+
 class PluginApp {
   public:
     using AuthorizerFn = std::function<bool(const Principal &, std::string_view operation, std::string &outError)>;
@@ -621,6 +626,7 @@ class PluginApp {
     std::string instructions;
     std::string bugsinkDsn;
     std::vector<Resource> resources;
+    std::vector<RequiredEnvVar> requiredEnvVars;
     ConcurrencyPolicy concurrency{ConcurrencyPolicy::Serialized};
     CachePolicy cachePolicy;
     std::vector<std::string> defaultRequiredScopes;
@@ -649,6 +655,11 @@ class PluginApp {
     }
 
     bool hasHttpRunner() const noexcept { return static_cast<bool>(httpRunner_); }
+
+    PluginApp &requireEnv(std::string name, std::string purpose) {
+        requiredEnvVars.push_back(RequiredEnvVar{std::move(name), std::move(purpose)});
+        return *this;
+    }
 
     template <typename InputStruct, typename Handler>
     PluginApp &tool(std::string name, std::string desc, ToolOptions opts, Handler &&h) {
@@ -1241,14 +1252,55 @@ class PluginApp {
             setBugsink(bugsinkDsn);
         }
 
-        if (argc == 1 || (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
-                                        std::strcmp(argv[1], "-h") == 0 ||
-                                        std::strcmp(argv[1], "--list") == 0))) {
+        bool skipChecks = false;
+        std::vector<char *> filteredArgv;
+        filteredArgv.reserve(static_cast<size_t>(argc > 0 ? argc : 1));
+        if (argc > 0 && argv != nullptr) {
+            filteredArgv.push_back(argv[0]);
+            for (int i = 1; i < argc; ++i) {
+                if (argv[i] != nullptr && std::strcmp(argv[i], "--skip-checks") == 0) {
+                    skipChecks = true;
+                } else {
+                    filteredArgv.push_back(argv[i]);
+                }
+            }
+        }
+        int fArgc = static_cast<int>(filteredArgv.size());
+
+        if (fArgc <= 1 || (fArgc == 2 && (std::strcmp(filteredArgv[1], "--help") == 0 ||
+                                          std::strcmp(filteredArgv[1], "-h") == 0 ||
+                                          std::strcmp(filteredArgv[1], "--list") == 0))) {
             printHelp();
             return 0;
         }
 
-        std::string firstArg = argv[1];
+        if (fArgc == 2 && std::strcmp(filteredArgv[1], "--version") == 0) {
+            std::cout << (key.empty() ? "app" : key) << " " << version << "\n";
+            return 0;
+        }
+
+        if (!skipChecks && !requiredEnvVars.empty()) {
+            std::vector<const RequiredEnvVar *> missing;
+            for (const auto &req : requiredEnvVars) {
+                const char *val = std::getenv(req.name.c_str());
+                if (val == nullptr || val[0] == '\0') {
+                    missing.push_back(&req);
+                }
+            }
+            if (!missing.empty()) {
+                std::cerr << "Missing required environment variable(s):\n";
+                for (const auto *req : missing) {
+                    std::cerr << "  " << req->name;
+                    if (!req->purpose.empty()) {
+                        std::cerr << ": " << req->purpose;
+                    }
+                    std::cerr << "\n";
+                }
+                return 1;
+            }
+        }
+
+        std::string firstArg = filteredArgv[1];
         if (firstArg == "mcp") {
             serveMcpStdio();
             return 0;
@@ -1259,7 +1311,7 @@ class PluginApp {
                 std::cerr << "HTTP transport is not enabled in this binary (link slimr::mcp_http).\n";
                 return 1;
             }
-            return httpRunner_(*this, argc, argv);
+            return httpRunner_(*this, fArgc, filteredArgv.data());
         }
 
         // CLI invocation of tool: <bin> <tool> ['{"arg":"val"}']
@@ -1271,8 +1323,8 @@ class PluginApp {
         }
 
         Json args = json_obj();
-        if (argc >= 3) {
-            auto parsed = parse_json<Json>(argv[2]);
+        if (fArgc >= 3) {
+            auto parsed = parse_json<Json>(filteredArgv[2]);
             if (!parsed) {
                 std::cerr << "Invalid JSON arguments: " << parsed.error() << "\n";
                 return 1;
@@ -1309,11 +1361,12 @@ class PluginApp {
     void printHelp() const {
         std::string prog = key.empty() ? "app" : key;
         std::cout << "Usage:\n";
-        std::cout << "  " << prog << " mcp\n";
+        std::cout << "  " << prog << " [--skip-checks] mcp\n";
         if (httpRunner_) {
-            std::cout << "  " << prog << " http [--host <addr>] [--port <n>]\n";
+            std::cout << "  " << prog << " [--skip-checks] http [--host <addr>] [--port <n>]\n";
         }
-        std::cout << "  " << prog << " <tool> ['{\"arg\":\"val\"}']\n\n";
+        std::cout << "  " << prog << " [--skip-checks] <tool> ['{\"arg\":\"val\"}']\n";
+        std::cout << "  " << prog << " --version | --help\n\n";
         std::cout << "Available tools:\n";
         for (const auto &[name, def] : tools_) {
             (void)name;

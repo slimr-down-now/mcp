@@ -490,6 +490,79 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         REQUIRE(app.bugsink() != nullptr);
         CHECK(app.bugsink()->release() == "custom@2.0.0");
     }
+
+    TEST_CASE("PluginApp --version, required env vars, and --skip-checks") {
+        unsetenv("SLIMR_TEST_REQ_A");
+        unsetenv("SLIMR_TEST_REQ_B");
+
+        PluginApp app("env-app", "2.3.4");
+        app.requireEnv("SLIMR_TEST_REQ_A", "API key")
+            .requireEnv("SLIMR_TEST_REQ_B", "Workspace ID");
+        app.tool<std::monostate>("ping", "Ping", [](const std::monostate &) { return "pong"; });
+
+        auto run_args = [&](std::initializer_list<const char *> args,
+                            std::string *outOut = nullptr,
+                            std::string *errOut = nullptr) {
+            std::vector<std::string> storage;
+            std::vector<char *> argv;
+            for (const char *s : args)
+                storage.emplace_back(s);
+            for (auto &s : storage)
+                argv.push_back(s.data());
+
+            std::ostringstream outBuf;
+            std::ostringstream errBuf;
+            auto *oldOut = std::cout.rdbuf(outBuf.rdbuf());
+            auto *oldErr = std::cerr.rdbuf(errBuf.rdbuf());
+            int rc = app.run(static_cast<int>(argv.size()), argv.data());
+            std::cout.rdbuf(oldOut);
+            std::cerr.rdbuf(oldErr);
+            if (outOut)
+                *outOut = outBuf.str();
+            if (errOut)
+                *errOut = errBuf.str();
+            return rc;
+        };
+
+        // --version and --help succeed even when required env vars are missing
+        std::string verOut;
+        CHECK(run_args({"env-app", "--version"}, &verOut) == 0);
+        CHECK(verOut == "env-app 2.3.4\n");
+        CHECK(run_args({"env-app", "--help"}) == 0);
+
+        // Missing env vars fail and list every missing var name and purpose
+        std::string errMsg;
+        CHECK(run_args({"env-app", "ping"}, nullptr, &errMsg) == 1);
+        CHECK(errMsg.find("SLIMR_TEST_REQ_A") != std::string::npos);
+        CHECK(errMsg.find("API key") != std::string::npos);
+        CHECK(errMsg.find("SLIMR_TEST_REQ_B") != std::string::npos);
+        CHECK(errMsg.find("Workspace ID") != std::string::npos);
+
+        // Empty env var is treated as missing; partial env reports only missing one
+        setenv("SLIMR_TEST_REQ_A", "valA", 1);
+        setenv("SLIMR_TEST_REQ_B", "", 1);
+        errMsg.clear();
+        CHECK(run_args({"env-app", "mcp"}, nullptr, &errMsg) == 1);
+        CHECK(errMsg.find("SLIMR_TEST_REQ_A") == std::string::npos);
+        CHECK(errMsg.find("SLIMR_TEST_REQ_B") != std::string::npos);
+
+        // --skip-checks bypasses env checks in leading or trailing positions
+        std::string toolOut;
+        CHECK(run_args({"env-app", "--skip-checks", "ping"}, &toolOut) == 0);
+        CHECK(toolOut == "pong\n");
+        toolOut.clear();
+        CHECK(run_args({"env-app", "ping", "--skip-checks"}, &toolOut) == 0);
+        CHECK(toolOut == "pong\n");
+
+        // Populated env vars allow normal execution
+        setenv("SLIMR_TEST_REQ_B", "valB", 1);
+        toolOut.clear();
+        CHECK(run_args({"env-app", "ping"}, &toolOut) == 0);
+        CHECK(toolOut == "pong\n");
+
+        unsetenv("SLIMR_TEST_REQ_A");
+        unsetenv("SLIMR_TEST_REQ_B");
+    }
 }
 
 #ifdef SLIMR_MCP_HAS_HTTP
@@ -1387,6 +1460,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             CHECK(run_args({"cli-http", "http", "--unknown-flag"}) == 2);
             CHECK(run_args({"cli-http", "http", "--allow-ephemeral-port"}) == 2);
             CHECK(run_args({"cli-http", "http", "--host", "not-an-ip"}) == 1);
+            CHECK(run_args({"cli-http", "--skip-checks", "http", "--host", "not-an-ip"}) == 1);
+            CHECK(run_args({"cli-http", "http", "--host", "not-an-ip", "--skip-checks"}) == 1);
         }
 
         // 2) Graceful stop drains and cancels an open active SSE stream within shutdown timeout
