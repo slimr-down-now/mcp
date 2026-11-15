@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     auto app = make_greet_app();
     slimr::HttpServerOptions httpOpts;
     httpOpts.host = "127.0.0.1";
-    httpOpts.port = 8081;
+    httpOpts.port = 10001;
     // Configure httpOpts.oauth (OAuthResourceConfig) for RFC 9728 metadata,
     // bearer validation, and required scopes. Consumers own any AS endpoints
     // via httpOpts.customRoutes.
