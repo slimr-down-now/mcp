@@ -9,6 +9,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -386,6 +388,7 @@ struct RequestContext {
     std::optional<std::string> minLogLevel;
     std::optional<Json> inputResponses;
     std::optional<std::string> requestState;
+    std::optional<Json> session;
     Principal principal;
     CancellationToken cancellation;
     std::shared_ptr<McpNotificationChannel> notificationChannel;
@@ -628,6 +631,7 @@ class PluginApp {
     std::vector<Resource> resources;
     std::vector<RequiredEnvVar> requiredEnvVars;
     ConcurrencyPolicy concurrency{ConcurrencyPolicy::Serialized};
+    bool allowCliTools{false};
     CachePolicy cachePolicy;
     std::vector<std::string> defaultRequiredScopes;
     AuthorizerFn authorizer;
@@ -1314,7 +1318,13 @@ class PluginApp {
             return httpRunner_(*this, fArgc, filteredArgv.data());
         }
 
-        // CLI invocation of tool: <bin> <tool> ['{"arg":"val"}']
+        // CLI invocation of tool: <bin> <tool> ['{"arg":"val"}' | @path | -]
+        if (!allowCliTools) {
+            std::string prog = key.empty() ? "app" : key;
+            std::cerr << "CLI tool calls are disabled for " << prog << "; use 'mcp' or 'http'\n";
+            return 1;
+        }
+
         const ToolDef *def = findTool(firstArg);
         if (!def) {
             std::cerr << "Unknown tool: " << firstArg << "\n";
@@ -1323,16 +1333,118 @@ class PluginApp {
         }
 
         Json args = json_obj();
+        RequestContext cliCtx;
         if (fArgc >= 3) {
-            auto parsed = parse_json<Json>(filteredArgv[2]);
+            std::string rawJson;
+            std::string_view rawArg = filteredArgv[2];
+            if (rawArg == "-") {
+                std::ostringstream ss;
+                ss << std::cin.rdbuf();
+                if (std::cin.bad()) {
+                    std::cerr << "Failed to read arguments from stdin\n";
+                    return 1;
+                }
+                rawJson = ss.str();
+            } else if (rawArg.starts_with('@')) {
+                if (rawArg.size() == 1) {
+                    std::cerr << "Invalid @path argument: missing file path\n";
+                    return 1;
+                }
+                std::filesystem::path filePath(rawArg.substr(1));
+                std::error_code ec;
+                if (std::filesystem::is_directory(filePath, ec)) {
+                    std::cerr << "Argument path is a directory: " << filePath.string() << "\n";
+                    return 1;
+                }
+                std::ifstream file(filePath, std::ios::binary);
+                if (!file) {
+                    std::cerr << "Failed to open argument file: " << filePath.string() << "\n";
+                    return 1;
+                }
+                std::ostringstream ss;
+                ss << file.rdbuf();
+                if (file.bad()) {
+                    std::cerr << "Failed to read argument file: " << filePath.string() << "\n";
+                    return 1;
+                }
+                rawJson = ss.str();
+            } else {
+                rawJson = std::string(rawArg);
+            }
+
+            auto parsed = parse_json<Json>(rawJson);
             if (!parsed) {
                 std::cerr << "Invalid JSON arguments: " << parsed.error() << "\n";
                 return 1;
             }
-            args = *parsed;
+            if (!parsed->is_object()) {
+                std::cerr << "CLI arguments must be a JSON object\n";
+                return 1;
+            }
+
+            const bool schemaHasInput = def->inputSchema.is_object() &&
+                                        def->inputSchema.contains("properties") &&
+                                        def->inputSchema["properties"].is_object() &&
+                                        def->inputSchema["properties"].contains("input");
+            const bool schemaHasContext = def->inputSchema.is_object() &&
+                                          def->inputSchema.contains("properties") &&
+                                          def->inputSchema["properties"].is_object() &&
+                                          def->inputSchema["properties"].contains("context");
+            const bool hasContext = parsed->contains("context");
+            const bool hasInput = parsed->contains("input");
+            const bool isEnvelope = (hasContext && !(schemaHasContext && !(*parsed)["context"].is_object())) ||
+                                    (hasInput && !schemaHasInput);
+
+            if (isEnvelope) {
+                for (const auto &[k, v] : parsed->get_object()) {
+                    (void)v;
+                    if (k != "input" && k != "context") {
+                        std::cerr << "Invalid CLI envelope key: " << k << "\n";
+                        return 1;
+                    }
+                }
+                if (hasInput) {
+                    if (!(*parsed)["input"].is_object()) {
+                        std::cerr << "CLI envelope 'input' must be a JSON object\n";
+                        return 1;
+                    }
+                    args = (*parsed)["input"];
+                } else {
+                    args = json_obj();
+                }
+                if (hasContext) {
+                    const Json &ctxJson = (*parsed)["context"];
+                    if (!ctxJson.is_object()) {
+                        std::cerr << "CLI envelope 'context' must be a JSON object\n";
+                        return 1;
+                    }
+                    for (const auto &[k, v] : ctxJson.get_object()) {
+                        if (k != "session") {
+                            std::cerr << "Invalid CLI context key: " << k << "\n";
+                            return 1;
+                        }
+                        if (!v.is_string() && !v.is_object()) {
+                            std::cerr << "CLI context 'session' must be a string or object\n";
+                            return 1;
+                        }
+                        cliCtx.session = v;
+                    }
+                }
+            } else {
+                args = *parsed;
+            }
         }
 
-        RequestContext cliCtx;
+        if (auto authErr = checkAuthorization(cliCtx.principal, def->requiredScopes, "tools/call:" + def->name, std::nullopt)) {
+            std::string msg = "Forbidden";
+            if (authErr->is_object() && authErr->contains("error") && (*authErr)["error"].is_object() &&
+                (*authErr)["error"].contains("message") && (*authErr)["error"]["message"].is_string()) {
+                msg = (*authErr)["error"]["message"].get_string();
+            }
+            std::cerr << msg << "\n";
+            return 1;
+        }
+
         McpResult res;
         try {
             res = def->handler(args, cliCtx);
@@ -1365,7 +1477,9 @@ class PluginApp {
         if (httpRunner_) {
             std::cout << "  " << prog << " [--skip-checks] http [--host <addr>] [--port <n>]\n";
         }
-        std::cout << "  " << prog << " [--skip-checks] <tool> ['{\"arg\":\"val\"}']\n";
+        if (allowCliTools) {
+            std::cout << "  " << prog << " [--skip-checks] <tool> ['{\"arg\":\"val\"}' | @path | -]\n";
+        }
         std::cout << "  " << prog << " --version | --help\n\n";
         std::cout << "Available tools:\n";
         for (const auto &[name, def] : tools_) {

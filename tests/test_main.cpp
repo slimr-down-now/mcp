@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -453,6 +455,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
     TEST_CASE("CLI direct invocation and redaction helper") {
         PluginApp app("cli-app");
+        app.allowCliTools = true;
         app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
             Json res = json_obj();
             res["result"] = in.a.get() + in.b.get();
@@ -478,6 +481,179 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         CHECK(red.find("state=ok") != std::string::npos);
     }
 
+    TEST_CASE("CLI opt-in allowCliTools, @path, stdin, and envelope context") {
+        struct HasInputField {
+            Field<std::string, "Input value"> input;
+        };
+
+        bool invoked = false;
+        std::optional<Json> seenSession;
+        bool seenAuth = true;
+
+        PluginApp app("cli-ctx");
+        app.tool<AddInput>("add", "Adds", [&](const AddInput &in, const RequestContext &ctx) {
+            invoked = true;
+            seenSession = ctx.session;
+            seenAuth = ctx.principal.authenticated;
+            Json res = json_obj();
+            res["sum"] = in.a.get() + in.b.get();
+            return res;
+        });
+        app.tool<std::monostate>("ping", "Ping", [&](const std::monostate &, const RequestContext &ctx) {
+            invoked = true;
+            seenSession = ctx.session;
+            seenAuth = ctx.principal.authenticated;
+            return "pong";
+        });
+        app.tool<HasInputField>("echo", "Echo", [&](const HasInputField &in, const RequestContext &ctx) {
+            invoked = true;
+            seenSession = ctx.session;
+            seenAuth = ctx.principal.authenticated;
+            return in.input.get();
+        });
+
+        auto runCli = [&](std::initializer_list<const char *> args, std::string *outBuf = nullptr, std::string *errBuf = nullptr) {
+            std::vector<std::string> storage;
+            std::vector<char *> argv;
+            for (const char *a : args)
+                storage.emplace_back(a);
+            for (auto &s : storage)
+                argv.push_back(s.data());
+
+            std::ostringstream capOut;
+            std::ostringstream capErr;
+            struct OstreamGuard {
+                std::ostream &stream;
+                std::streambuf *prev;
+                ~OstreamGuard() { stream.rdbuf(prev); }
+            };
+            OstreamGuard outGuard{std::cout, std::cout.rdbuf(capOut.rdbuf())};
+            OstreamGuard errGuard{std::cerr, std::cerr.rdbuf(capErr.rdbuf())};
+            int rc = app.run(static_cast<int>(argv.size()), argv.data());
+            if (outBuf)
+                *outBuf = capOut.str();
+            if (errBuf)
+                *errBuf = capErr.str();
+            return rc;
+        };
+
+        // 1) Default allowCliTools == false
+        CHECK(app.allowCliTools == false);
+        std::string o;
+        std::string e;
+        CHECK(runCli({"cli-ctx", "--help"}, &o) == 0);
+        CHECK(o.find("Available tools:") != std::string::npos);
+        CHECK(o.find("<tool>") == std::string::npos);
+
+        CHECK(runCli({"cli-ctx", "add", R"({"a":1,"b":2})"}, &o, &e) == 1);
+        CHECK(e.find("CLI tool calls are disabled for cli-ctx; use 'mcp' or 'http'") != std::string::npos);
+        CHECK(invoked == false);
+
+        // 2) Opt in: help lists @path | -, non-object JSON rejected
+        app.allowCliTools = true;
+        o.clear();
+        CHECK(runCli({"cli-ctx", "--help"}, &o) == 0);
+        CHECK(o.find("<tool>") != std::string::npos);
+        CHECK(o.find("@path | -") != std::string::npos);
+
+        CHECK(runCli({"cli-ctx", "add", "[1,2]"}, nullptr, &e) == 1);
+        CHECK(invoked == false);
+
+        // 3) @path valid, empty @, directory, missing file
+        struct TempDirGuard {
+            std::filesystem::path dir;
+            ~TempDirGuard() {
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+            }
+        };
+        TempDirGuard tmp{std::filesystem::current_path() / "slimr_mcp_cli_test_tmp"};
+        std::filesystem::create_directories(tmp.dir);
+        auto jsonFile = tmp.dir / "args.json";
+        {
+            std::ofstream f(jsonFile);
+            f << R"({"a":10,"b":5})";
+        }
+        std::string atFile = "@" + jsonFile.string();
+        std::string atDir = "@" + tmp.dir.string();
+        std::string atMissing = "@" + (tmp.dir / "missing.json").string();
+
+        o.clear();
+        CHECK(runCli({"cli-ctx", "add", atFile.c_str()}, &o, &e) == 0);
+        CHECK(o.find("\"sum\":15") != std::string::npos);
+        CHECK(invoked == true);
+        CHECK(!seenSession.has_value());
+        CHECK(seenAuth == false);
+
+        invoked = false;
+        CHECK(runCli({"cli-ctx", "add", "@"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", atDir.c_str()}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", atMissing.c_str()}, nullptr, &e) == 1);
+        CHECK(invoked == false);
+
+        // 4) stdin (-) valid and invalid
+        struct IstreamGuard {
+            std::istream &stream;
+            std::streambuf *prev;
+            ~IstreamGuard() { stream.rdbuf(prev); }
+        };
+        {
+            std::istringstream in(R"({"a":7,"b":8})");
+            IstreamGuard inGuard{std::cin, std::cin.rdbuf(in.rdbuf())};
+            o.clear();
+            CHECK(runCli({"cli-ctx", "add", "-"}, &o, &e) == 0);
+            CHECK(o.find("\"sum\":15") != std::string::npos);
+        }
+        {
+            invoked = false;
+            std::istringstream in("not json");
+            IstreamGuard inGuard{std::cin, std::cin.rdbuf(in.rdbuf())};
+            CHECK(runCli({"cli-ctx", "add", "-"}, nullptr, &e) == 1);
+            CHECK(invoked == false);
+        }
+
+        // 5) Envelope with string session and object session (omitted input)
+        invoked = false;
+        o.clear();
+        CHECK(runCli({"cli-ctx", "add", R"({"input":{"a":3,"b":4},"context":{"session":"sess-1"}})"}, &o, &e) == 0);
+        CHECK(invoked == true);
+        CHECK(o.find("\"sum\":7") != std::string::npos);
+        REQUIRE(seenSession.has_value());
+        CHECK(seenSession->is_string());
+        CHECK(seenSession->get_string() == "sess-1");
+        CHECK(seenAuth == false);
+
+        invoked = false;
+        o.clear();
+        CHECK(runCli({"cli-ctx", "ping", R"({"context":{"session":{"id":"s2","tab":7}}})"}, &o, &e) == 0);
+        CHECK(invoked == true);
+        CHECK(o == "pong\n");
+        REQUIRE(seenSession.has_value());
+        CHECK(seenSession->is_object());
+        CHECK((*seenSession)["id"].get_string() == "s2");
+        CHECK(seenAuth == false);
+
+        // 6) Tool with 'input' property passes plain args through
+        invoked = false;
+        o.clear();
+        CHECK(runCli({"cli-ctx", "echo", R"({"input":"hello"})"}, &o, &e) == 0);
+        CHECK(invoked == true);
+        CHECK(o == "hello\n");
+        CHECK(!seenSession.has_value());
+
+        // 7) Invalid envelope and context cases fail without invoking handler
+        invoked = false;
+        CHECK(runCli({"cli-ctx", "add", R"({"input":{"a":1,"b":2},"extra":1})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"input":"bad"})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":"bad"})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":{"principal":{"subject":"x"}}})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":{"scopes":["admin"]}})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":{"other":"x"}})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":{"session":123}})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"context":{"session":null}})"}, nullptr, &e) == 1);
+        CHECK(invoked == false);
+    }
+
     TEST_CASE("PluginApp setBugsink populates bugsinkDsn and release") {
         PluginApp app("test-app", "1.0.0");
         CHECK(app.bugsinkDsn.empty());
@@ -496,6 +672,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         unsetenv("SLIMR_TEST_REQ_B");
 
         PluginApp app("env-app", "2.3.4");
+        app.allowCliTools = true;
         app.requireEnv("SLIMR_TEST_REQ_A", "API key")
             .requireEnv("SLIMR_TEST_REQ_B", "Workspace ID");
         app.tool<std::monostate>("ping", "Ping", [](const std::monostate &) { return "pong"; });
@@ -810,6 +987,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
     TEST_CASE("Stdio transport edge cases and CLI run branches") {
         PluginApp app("cli-app", "0.2.0");
+        app.allowCliTools = true;
         app.tool<AddInput>("add", "Adds", [](const AddInput &in) {
             return std::to_string(in.a.get() + in.b.get());
         });
