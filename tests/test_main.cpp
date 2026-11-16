@@ -742,7 +742,9 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         CHECK(app.dispatchMcpJson(badVer)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
         Json badJsonRpc = make_req(2, "tools/list");
         badJsonRpc["jsonrpc"] = "1.0";
-        CHECK(app.dispatchMcpJson(badJsonRpc)["id"].get<int64_t>() == 2);
+        Json badJsonRpcResp = app.dispatchMcpJson(badJsonRpc);
+        CHECK(badJsonRpcResp["id"].get<int64_t>() == 2);
+        CHECK(badJsonRpcResp["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
         Json emptyMethod = make_req(3, "");
         CHECK(app.dispatchMcpJson(emptyMethod)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
         Json unknownMethod = make_req(4, "no/suchMethod");
@@ -842,11 +844,14 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
 
             std::ostringstream capOut;
             std::ostringstream capErr;
-            auto *oldOut = std::cout.rdbuf(capOut.rdbuf());
-            auto *oldErr = std::cerr.rdbuf(capErr.rdbuf());
+            struct RdbufGuard {
+                std::ostream &stream;
+                std::streambuf *prev;
+                ~RdbufGuard() { stream.rdbuf(prev); }
+            };
+            RdbufGuard outGuard{std::cout, std::cout.rdbuf(capOut.rdbuf())};
+            RdbufGuard errGuard{std::cerr, std::cerr.rdbuf(capErr.rdbuf())};
             int rc = app.run(static_cast<int>(argv.size()), argv.data());
-            std::cout.rdbuf(oldOut);
-            std::cerr.rdbuf(oldErr);
             if (outBuf)
                 *outBuf = capOut.str();
             if (errBuf)
