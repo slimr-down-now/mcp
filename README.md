@@ -2,7 +2,7 @@
 
 MCP-first C++26 framework (`2026-07-28` specification) turning reflected C++ structs into a stdio MCP server, a standalone Streamable HTTP + OAuth Resource Server daemon (`slimr::mcp_http`), and a narrow JSON CLI.
 
-> **Breaking change (`2026-07-28`):** `slimr::Gateway` and pre-July session/init APIs (`initialize`, `ping`, HTTP session IDs, GET SSE streams) have been removed. Each plugin runs as its own native binary (`<bin> mcp` or `<bin> http`) with typed [`RequestContext`](mcp.hpp) metadata, `server/discover`, `resultType` / MRTR (`-32021`), `CacheableResult`, and cooperative cancellation.
+> **Breaking change (`2026-07-28`):** `slimr::Gateway` and pre-July session/init APIs (`initialize`, `ping`, HTTP session IDs, GET SSE streams) have been removed. Each plugin runs as its own native binary (`<bin> mcp` or `<bin> http`) with typed [`RequestContext`](ports/slimr-mcp/mcp.hpp) metadata, `server/discover`, `resultType` / MRTR (`-32021`), `CacheableResult`, and cooperative cancellation.
 
 ## Why `slimr::mcp`?
 
