@@ -1,6 +1,6 @@
 #define SLIMR_TEST_MAIN
-#include "test.hpp"
 #include "mcp.hpp"
+#include "test.hpp"
 #ifdef SLIMR_MCP_HAS_HTTP
 #include "mcp_http.hpp"
 #include <arpa/inet.h>
