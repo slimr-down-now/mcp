@@ -65,5 +65,4 @@ Never run `test.yml` manually before `just release` (because `release` runs `tes
 ## Repository notes
 
 - Library sources (`mcp.hpp`, `mcp_http.hpp`, `mcp_oauth.hpp`) live only in `ports/slimr-mcp/`.
-- `vcpkg-configuration.json` keeps the in-repo `"overlay-ports": ["./ports/libhv"]` entry so `libhv` builds from this repo.
-- Run `check.ts` with `--name slimr-mcp` (this repo has two ports: `slimr-mcp` and `libhv`).
+- Run `check.ts` with `--name slimr-mcp`.

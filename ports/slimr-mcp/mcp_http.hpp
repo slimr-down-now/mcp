@@ -1,14 +1,10 @@
 #pragma once
 #include "mcp_oauth.hpp"
 
-#include <hv/EventLoop.h>
-#include <hv/HttpServer.h>
-#include <hv/hlog.h>
+#include <httplib.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -20,9 +16,7 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
-#include <future>
 #include <iostream>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,7 +25,6 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -55,17 +48,6 @@ struct HttpServerOptions {
 };
 
 namespace mcp_detail {
-
-struct HttpListenSocket {
-    int fd{-1};
-    explicit HttpListenSocket(int value) : fd(value) {}
-    HttpListenSocket(const HttpListenSocket &) = delete;
-    HttpListenSocket &operator=(const HttpListenSocket &) = delete;
-    ~HttpListenSocket() {
-        if (fd >= 0)
-            ::close(fd);
-    }
-};
 
 inline bool is_valid_ip_literal(std::string_view host, bool *isIpv6 = nullptr) {
     if (host.empty() || host.size() >= 64)
@@ -330,152 +312,115 @@ class McpHttpServer {
             return false;
         }
 
-        hlog_disable();
-        service_ = std::make_unique<hv::HttpService>();
-        service_->document_root.clear();
-        service_->home_page.clear();
-        service_->error_page.clear();
-        service_->index_of.clear();
-        service_->staticDirs.clear();
-        service_->proxies.clear();
-        service_->trustProxies.clear();
-        service_->noProxies.clear();
-        service_->keepalive_timeout = opts_.keepaliveTimeoutMs;
-        service_->staticHandler = ::http_sync_handler([](::HttpRequest *, ::HttpResponse *) { return 404; });
+        svr_ = std::make_unique<httplib::Server>();
+        const size_t baseThreads = std::max<size_t>(16, opts_.workerThreads + 8);
+        const size_t maxThreads = std::max<size_t>(baseThreads, static_cast<size_t>(opts_.maxConnections) + 16);
+        svr_->new_task_queue = [baseThreads, maxThreads]() {
+            return new httplib::ThreadPool(baseThreads, maxThreads, 0);
+        };
+        svr_->set_payload_max_length(opts_.maxRequestBytes);
+        svr_->set_keep_alive_timeout(std::max<time_t>(1, (opts_.keepaliveTimeoutMs + 999) / 1000));
+        svr_->set_write_timeout(0, 500000);
 
-        // Reject oversized Content-Length before reading large bodies.
-        service_->headerHandler = http_ctx_handler([this](const HttpContextPtr &c) -> int {
-            try {
-                std::erase_if(responseWriters_, [](const auto &w) { return w.expired(); });
-                if (std::ranges::none_of(responseWriters_, [&](const auto &w) {
-                        return w.lock() == c->writer;
-                    })) {
-                    responseWriters_.push_back(c->writer);
-                }
-                if (draining_.load(std::memory_order_acquire)) {
-                    sendResponse(c->writer, 503, "application/json", "{\"error\":\"server_stopping\"}",
-                                 {{"Connection", "close"}});
-                    return HTTP_STATUS_UNFINISHED;
-                }
-                std::string cl = c->header("Content-Length");
-                if (!cl.empty()) {
-                    char *endPtr = nullptr;
-                    unsigned long long len = std::strtoull(cl.c_str(), &endPtr, 10);
-                    if (endPtr == cl.c_str() || *endPtr != '\0' || len > opts_.maxRequestBytes) {
-                        sendJsonText(c->writer, 413, "{\"error\":\"payload_too_large\"}");
-                        return HTTP_STATUS_UNFINISHED;
-                    }
-                }
-            } catch (...) {
-                sendJsonText(c->writer, 400, "{\"error\":\"bad_request\"}");
-                return HTTP_STATUS_UNFINISHED;
+        // Reject draining requests and oversized Content-Length before reading large bodies.
+        svr_->set_pre_routing_handler([this](const httplib::Request &req, httplib::Response &res) {
+            if (draining_.load(std::memory_order_acquire)) {
+                res.set_header("Connection", "close");
+                res.status = 503;
+                res.set_content("{\"error\":\"server_stopping\"}", "application/json");
+                return httplib::Server::HandlerResponse::Handled;
             }
-            return HTTP_STATUS_NEXT;
+            if (req.has_header("Content-Length")) {
+                std::string cl = req.get_header_value("Content-Length");
+                char *endPtr = nullptr;
+                unsigned long long len = std::strtoull(cl.c_str(), &endPtr, 10);
+                if (endPtr == cl.c_str() || *endPtr != '\0' || len > opts_.maxRequestBytes) {
+                    res.status = 413;
+                    res.set_content("{\"error\":\"payload_too_large\"}", "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
         });
 
-        // Protected Resource Metadata (RFC 9728)
-        std::string metaPrimary = normalizedMetadataPath();
-        std::string metaSuffixed = metaPrimary + normalizedMcpPath();
-        auto metaHandler = http_ctx_handler([this](const HttpContextPtr &c) -> int {
-            try {
-                Json doc = opts_.oauth.metadata.toJson(mcpEndpointUrl());
-                sendJsonText(c->writer, 200, slimr::write_json(doc));
-            } catch (const std::exception &e) {
-                sendJsonText(c->writer, 500, "{\"error\":\"internal_error\",\"message\":\"" + redact_sensitive(e.what()) + "\"}");
-            } catch (...) {
-                sendJsonText(c->writer, 500, "{\"error\":\"internal_error\"}");
-            }
-            return HTTP_STATUS_UNFINISHED;
-        });
-        service_->GET(metaPrimary.c_str(), metaHandler);
-        if (metaSuffixed != metaPrimary) {
-            service_->GET(metaSuffixed.c_str(), metaHandler);
-        }
-
-        // Consumer-mounted custom routes (AS, pairing UI, health, etc.)
+        // Consumer-mounted custom routes (registered before fallback PRM routes; first-match-wins).
         for (const auto &route : opts_.customRoutes) {
             registerCustomRoute(route);
         }
 
+        // Protected Resource Metadata (RFC 9728)
+        std::string metaPrimary = normalizedMetadataPath();
+        std::string metaSuffixed = metaPrimary + normalizedMcpPath();
+        auto metaHandler = [this](const httplib::Request &, httplib::Response &res) {
+            try {
+                Json doc = opts_.oauth.metadata.toJson(mcpEndpointUrl());
+                sendJsonText(res, 200, slimr::write_json(doc));
+            } catch (const std::exception &e) {
+                sendJsonText(res, 500, "{\"error\":\"internal_error\",\"message\":\"" + redact_sensitive(e.what()) + "\"}");
+            } catch (...) {
+                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
+            }
+        };
+        svr_->Get(metaPrimary, metaHandler);
+        if (metaSuffixed != metaPrimary) {
+            svr_->Get(metaSuffixed, metaHandler);
+        }
+
         // Single Streamable HTTP endpoint: POST /mcp; 405 on other methods.
         std::string path = normalizedMcpPath();
-        service_->POST(path.c_str(), http_ctx_handler([this](const HttpContextPtr &c) -> int {
-                           try {
-                               handleMcpPost(c);
-                           } catch (const std::exception &e) {
-                               sendJsonText(c->writer, 500,
-                                            slimr::write_json(*app_.makeErrorResponse(
-                                                std::nullopt, McpErrorCode::InternalError, redact_sensitive(e.what()))));
-                           } catch (...) {
-                               sendJsonText(c->writer, 500, "{\"error\":\"internal_error\"}");
-                           }
-                           return HTTP_STATUS_UNFINISHED;
-                       }));
-        auto methodNotAllowed = http_ctx_handler([this](const HttpContextPtr &c) -> int {
-            sendResponse(c->writer, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
-                         {{"Allow", "POST"}});
-            return HTTP_STATUS_UNFINISHED;
-        });
-        service_->GET(path.c_str(), methodNotAllowed);
-        service_->Delete(path.c_str(), methodNotAllowed);
-        service_->PUT(path.c_str(), methodNotAllowed);
-
-        server_ = std::make_unique<hv::HttpServer>(service_.get());
-        server_->setHost(opts_.host.c_str());
-        server_->setPort(opts_.port);
-        server_->setThreadNum(1);
-        server_->setMaxWorkerConnectionNum(opts_.maxConnections);
-
-        // libhv only binds positive ports itself. Transfer an ephemeral listener
-        // to its event loop on successful start; retain ownership on failure.
-        mcp_detail::HttpListenSocket listener(opts_.port == 0 ? Listen(0, opts_.host.c_str()) : -1);
-        if (opts_.port == 0) {
-            if (listener.fd < 0) {
-                server_.reset();
-                service_.reset();
-                if (errOut)
-                    *errOut = "Failed to bind ephemeral HTTP listener on " + opts_.host;
-                return false;
+        svr_->Post(path, [this](const httplib::Request &req, httplib::Response &res) {
+            try {
+                handleMcpPost(req, res);
+            } catch (const std::exception &e) {
+                sendJsonText(res, 500,
+                             slimr::write_json(*app_.makeErrorResponse(
+                                 std::nullopt, McpErrorCode::InternalError, redact_sensitive(e.what()))));
+            } catch (...) {
+                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
             }
-            server_->setListenFD(listener.fd);
-        }
+        });
+        auto methodNotAllowed = [](const httplib::Request &, httplib::Response &res) {
+            sendResponse(res, 405, "application/json", "{\"error\":\"method_not_allowed\"}",
+                         {{"Allow", "POST"}});
+        };
+        svr_->Get(path, methodNotAllowed);
+        svr_->Delete(path, methodNotAllowed);
+        svr_->Put(path, methodNotAllowed);
 
         draining_.store(false, std::memory_order_release);
         startWorkers();
 
-        if (server_->start() != 0) {
+        int actualPort = -1;
+        if (opts_.port == 0) {
+            actualPort = svr_->bind_to_any_port(opts_.host);
+        } else if (svr_->bind_to_port(opts_.host, opts_.port)) {
+            actualPort = opts_.port;
+        }
+        if (actualPort <= 0) {
             stopWorkers(true);
-            server_.reset();
-            service_.reset();
+            svr_.reset();
             if (errOut) {
                 *errOut = "Failed to bind HTTP server on " + opts_.host + ":" + std::to_string(opts_.port);
             }
             return false;
         }
-        listener.fd = -1;
 
-        std::shared_ptr<hv::EventLoop> loop;
-        while (!(loop = server_->loop(0)) || !loop->isRunning()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        loop_ = loop;
-
-        uint16_t actualPort = 0;
-        if (server_->listenfd[0] >= 0) {
-            struct sockaddr_storage ss{};
-            socklen_t len = sizeof(ss);
-            if (getsockname(server_->listenfd[0], reinterpret_cast<struct sockaddr *>(&ss), &len) == 0) {
-                if (ss.ss_family == AF_INET) {
-                    actualPort = ntohs(reinterpret_cast<struct sockaddr_in *>(&ss)->sin_port);
-                } else if (ss.ss_family == AF_INET6) {
-                    actualPort = ntohs(reinterpret_cast<struct sockaddr_in6 *>(&ss)->sin6_port);
-                }
+        acceptThread_ = std::thread([this]() { svr_->listen_after_bind(); });
+        svr_->wait_until_ready();
+        if (!svr_->is_running()) {
+            svr_->stop();
+            if (acceptThread_.joinable()) {
+                acceptThread_.join();
             }
+            stopWorkers(true);
+            svr_.reset();
+            if (errOut) {
+                *errOut = "Failed to start HTTP server on " + opts_.host + ":" + std::to_string(actualPort);
+            }
+            return false;
         }
-        if (actualPort == 0 && opts_.port > 0) {
-            actualPort = static_cast<uint16_t>(opts_.port);
-        }
-        boundPort_.store(actualPort, std::memory_order_release);
+
+        boundPort_.store(static_cast<uint16_t>(actualPort), std::memory_order_release);
         running_.store(true, std::memory_order_release);
         return true;
     }
@@ -492,26 +437,14 @@ class McpHttpServer {
             std::lock_guard lock(workerState_->mu);
             workerState_->rejectNew = true;
         }
-        auto loop = loop_.lock();
-        callOnLoop(loop, [this, loop]() {
-            // This server has one I/O loop. hio_close releases its listener;
-            // http_server_stop owns loop/thread teardown, not a second fd close.
-            for (int &fd : server_->listenfd) {
-                if (fd >= 0) {
-                    if (hio_close(hio_get(loop->loop(), fd)) != 0) {
-                        throw std::runtime_error("Failed to close HTTP listener");
-                    }
-                    fd = -1;
-                }
-            }
-        });
 
         // Wait up to shutdownTimeoutMs for natural completion of in-flight jobs before cancelling.
         auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(std::max(0, opts_.shutdownTimeoutMs));
+        bool drainedNaturally = false;
         {
             std::unique_lock lock(workerState_->mu);
-            workerState_->idleCv.wait_until(lock, deadline, [&]() {
+            drainedNaturally = workerState_->idleCv.wait_until(lock, deadline, [&]() {
                 return workerState_->queue.empty() && workerState_->activeCount == 0;
             });
             for (auto &wk : workerState_->activeCancels) {
@@ -520,32 +453,22 @@ class McpHttpServer {
             }
         }
 
-        stopWorkers(false);
-
-        if (server_) {
-            const auto flushDeadline = std::chrono::steady_clock::now() +
-                                       std::chrono::milliseconds(std::clamp(opts_.shutdownTimeoutMs, 50, 500));
-            // The first loop barrier also executes final-response callbacks
-            // queued by workers before they exited, even with no buffered data.
-            while (!callOnLoop(loop, [this]() {
-                return std::ranges::none_of(responseWriters_, [](const auto &weak) {
-                    auto w = weak.lock();
-                    return w && w->id() == hio_id(w->io()) &&
-                           hio_is_opened(w->io()) && !w->isWriteComplete();
-                });
-            })) {
-                if (std::chrono::steady_clock::now() >= flushDeadline) {
-                    std::cerr << "MCP HTTP shutdown: response flush timed out; closing pending connections\n";
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            server_->stop();
-            server_.reset();
+        // Allow naturally completed responses to finish writing before svr_->stop() aborts chunked writes.
+        if (drainedNaturally) {
+            std::unique_lock lock(workerState_->mu);
+            workerState_->responsesCv.wait_until(lock, deadline, [&]() {
+                return workerState_->inFlightResponses == 0;
+            });
         }
-        responseWriters_.clear();
-        loop_.reset();
-        service_.reset();
+
+        if (svr_) {
+            svr_->stop();
+        }
+        if (acceptThread_.joinable()) {
+            acceptThread_.join();
+        }
+        stopWorkers(false);
+        svr_.reset();
         boundPort_.store(0, std::memory_order_release);
     }
 
@@ -574,21 +497,15 @@ class McpHttpServer {
     }
 
   private:
-    template <class Fn>
-    static std::invoke_result_t<Fn> callOnLoop(const std::shared_ptr<hv::EventLoop> &loop, Fn fn) {
-        auto task = std::make_shared<std::packaged_task<std::invoke_result_t<Fn>()>>(std::move(fn));
-        auto result = task->get_future();
-        loop->queueInLoop([task]() { (*task)(); });
-        return result.get();
-    }
-
     struct WorkerState {
         std::mutex mu;
         std::condition_variable cv;
         std::condition_variable idleCv;
+        std::condition_variable responsesCv;
         std::deque<std::function<void()>> queue;
         std::vector<std::weak_ptr<CancellationSource>> activeCancels;
         size_t activeCount{0};
+        size_t inFlightResponses{0};
         bool rejectNew{false};
         bool stopping{false};
     };
@@ -603,89 +520,87 @@ class McpHttpServer {
         return "/.well-known/oauth-protected-resource";
     }
 
-    static void sendResponse(const HttpResponseWriterPtr &w,
+    static void sendResponse(httplib::Response &res,
                              int status,
                              std::string_view contentType,
                              const std::string &body,
                              std::vector<std::pair<std::string, std::string>> extraHeaders = {}) {
-        if (!w || !w->isOpened())
-            return;
-        w->Begin();
-        w->WriteStatus(static_cast<http_status>(status));
-        std::string ct(contentType);
-        w->WriteHeader("Content-Type", ct.c_str());
+        res.status = status;
         for (const auto &[k, v] : extraHeaders) {
-            w->WriteHeader(k.c_str(), v.c_str());
+            res.set_header(k, v);
         }
-        if (body.empty()) {
-            w->End("", 0);
-        } else if (std::in_range<int>(body.size())) {
-            w->End(body.c_str(), static_cast<int>(body.size()));
-        } else {
-            w->End(body);
-        }
+        res.set_content(body, std::string(contentType));
     }
 
-    static void sendJsonText(const HttpResponseWriterPtr &w,
+    static void sendJsonText(httplib::Response &res,
                              int status,
                              const std::string &jsonStr,
                              std::vector<std::pair<std::string, std::string>> extraHeaders = {}) {
-        sendResponse(w, status, "application/json", jsonStr, std::move(extraHeaders));
+        sendResponse(res, status, "application/json", jsonStr, std::move(extraHeaders));
     }
 
-    static HttpRouteRequest toRouteRequest(const HttpContextPtr &c) {
-        HttpRouteRequest req;
-        req.method = http_method_str(c->method());
-        req.path = c->path();
-        req.rawQuery = c->url();
-        req.queryParams = mcp_detail::parse_query_params(c->url());
-        for (const auto &[k, v] : c->headers()) {
-            req.headers[mcp_detail::ascii_lower(k)] = v;
+    static HttpRouteRequest toRouteRequest(const httplib::Request &req) {
+        HttpRouteRequest out;
+        out.method = req.method;
+        out.path = req.path;
+        out.rawQuery = req.target;
+        out.queryParams = mcp_detail::parse_query_params(req.target);
+        for (const auto &[k, v] : req.headers) {
+            out.headers[mcp_detail::ascii_lower(k)] = v;
         }
-        req.body = c->body();
-        req.remoteAddr = c->ip() + ":" + std::to_string(c->port());
-        return req;
+        out.body = req.body;
+        out.remoteAddr = req.remote_addr + ":" + std::to_string(req.remote_port);
+        return out;
     }
 
     void registerCustomRoute(const CustomHttpRoute &route) {
         if (!route.handler || route.path.empty())
             return;
-        auto wrap = http_ctx_handler([this, route](const HttpContextPtr &c) -> int {
+        auto wrap = [this, route](const httplib::Request &req, httplib::Response &res) {
             try {
-                if (c->body().size() > opts_.maxRequestBytes) {
-                    sendJsonText(c->writer, 413, "{\"error\":\"payload_too_large\"}");
-                    return HTTP_STATUS_UNFINISHED;
+                if (req.body.size() > opts_.maxRequestBytes) {
+                    sendJsonText(res, 413, "{\"error\":\"payload_too_large\"}");
+                    return;
                 }
-                HttpRouteRequest rreq = toRouteRequest(c);
+                HttpRouteRequest rreq = toRouteRequest(req);
                 HttpRouteResponse rresp = route.handler(rreq);
                 std::vector<std::pair<std::string, std::string>> hdrs;
                 hdrs.reserve(rresp.headers.size());
                 for (const auto &[k, v] : rresp.headers) {
                     hdrs.emplace_back(k, v);
                 }
-                sendResponse(c->writer, rresp.status, rresp.contentType, rresp.body, std::move(hdrs));
+                sendResponse(res, rresp.status, rresp.contentType, rresp.body, std::move(hdrs));
             } catch (const std::exception &e) {
-                sendJsonText(c->writer, 500, "{\"error\":\"internal_error\",\"message\":\"" + redact_sensitive(e.what()) + "\"}");
+                sendJsonText(res, 500, "{\"error\":\"internal_error\",\"message\":\"" + redact_sensitive(e.what()) + "\"}");
             } catch (...) {
-                sendJsonText(c->writer, 500, "{\"error\":\"internal_error\"}");
+                sendJsonText(res, 500, "{\"error\":\"internal_error\"}");
             }
-            return HTTP_STATUS_UNFINISHED;
-        });
+        };
 
         std::string m = mcp_detail::ascii_lower(route.method);
         if (m == "get")
-            service_->GET(route.path.c_str(), wrap);
+            svr_->Get(route.path, wrap);
         else if (m == "post")
-            service_->POST(route.path.c_str(), wrap);
+            svr_->Post(route.path, wrap);
         else if (m == "delete")
-            service_->Delete(route.path.c_str(), wrap);
+            svr_->Delete(route.path, wrap);
         else if (m == "put")
-            service_->PUT(route.path.c_str(), wrap);
-        else if (m == "*")
-            service_->Any(route.path.c_str(), wrap);
+            svr_->Put(route.path, wrap);
+        else if (m == "patch")
+            svr_->Patch(route.path, wrap);
+        else if (m == "options")
+            svr_->Options(route.path, wrap);
+        else if (m == "*") {
+            svr_->Get(route.path, wrap);
+            svr_->Post(route.path, wrap);
+            svr_->Delete(route.path, wrap);
+            svr_->Put(route.path, wrap);
+            svr_->Patch(route.path, wrap);
+            svr_->Options(route.path, wrap);
+        }
     }
 
-    void sendOAuthUnauthorized(const HttpResponseWriterPtr &w,
+    void sendOAuthUnauthorized(httplib::Response &res,
                                std::span<const std::string> scopes,
                                std::string_view desc) const {
         std::string www = mcp_detail::build_www_authenticate(
@@ -693,10 +608,10 @@ class McpHttpServer {
         Json body = json_obj();
         body["error"] = "unauthorized";
         body["error_description"] = std::string(desc);
-        sendJsonText(w, 401, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
+        sendJsonText(res, 401, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
     }
 
-    void sendOAuthInsufficientScope(const HttpResponseWriterPtr &w,
+    void sendOAuthInsufficientScope(httplib::Response &res,
                                     std::span<const std::string> scopes,
                                     std::string_view desc) const {
         std::string www = mcp_detail::build_www_authenticate(
@@ -704,13 +619,13 @@ class McpHttpServer {
         Json body = json_obj();
         body["error"] = "insufficient_scope";
         body["error_description"] = std::string(desc);
-        sendJsonText(w, 403, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
+        sendJsonText(res, 403, slimr::write_json(body), {{"WWW-Authenticate", std::move(www)}});
     }
 
     std::optional<std::string> validateHttpMcpHeaders(const Json &req,
-                                                      const HttpContextPtr &c,
+                                                      const httplib::Request &httpReq,
                                                       const std::string &method) const {
-        std::string protoHdr = c->header("MCP-Protocol-Version");
+        std::string protoHdr = httpReq.get_header_value("MCP-Protocol-Version");
         if (protoHdr.empty()) {
             return "Missing required MCP-Protocol-Version header";
         }
@@ -725,7 +640,7 @@ class McpHttpServer {
             return "Header mismatch: MCP-Protocol-Version '" + protoHdr + "' does not match body '_meta.io.modelcontextprotocol/protocolVersion'";
         }
 
-        std::string methodHdr = c->header("Mcp-Method");
+        std::string methodHdr = httpReq.get_header_value("Mcp-Method");
         if (methodHdr.empty()) {
             return "Missing required Mcp-Method header";
         }
@@ -734,7 +649,7 @@ class McpHttpServer {
         }
 
         if (method == "tools/call" || method == "resources/read" || method == "prompts/get") {
-            std::string rawNameHdr = c->header("Mcp-Name");
+            std::string rawNameHdr = httpReq.get_header_value("Mcp-Name");
             if (rawNameHdr.empty()) {
                 return "Missing required Mcp-Name header for method '" + method + "'";
             }
@@ -764,7 +679,7 @@ class McpHttpServer {
                         args = req["params"]["arguments"];
                     }
                     for (const auto &spec : headerSpecs) {
-                        std::string hdrVal = c->header(spec.headerName.c_str());
+                        std::string hdrVal = httpReq.get_header_value(spec.headerName);
                         bool inBody = args.contains(spec.paramPath) && !args[spec.paramPath].is_null();
                         if (inBody && hdrVal.empty()) {
                             return "Missing required header " + spec.headerName + " for parameter '" + spec.paramPath + "'";
@@ -805,26 +720,26 @@ class McpHttpServer {
         }
     }
 
-    void handleMcpPost(const HttpContextPtr &c) {
-        if (!mcp_detail::is_json_content_type(c->header("Content-Type"))) {
-            sendJsonText(c->writer, 415, "{\"error\":\"unsupported_media_type\"}");
+    void handleMcpPost(const httplib::Request &httpReq, httplib::Response &res) {
+        if (!mcp_detail::is_json_content_type(httpReq.get_header_value("Content-Type"))) {
+            sendJsonText(res, 415, "{\"error\":\"unsupported_media_type\"}");
             return;
         }
 
-        if (c->body().size() > opts_.maxRequestBytes) {
-            sendJsonText(c->writer, 413, "{\"error\":\"payload_too_large\"}");
+        if (httpReq.body.size() > opts_.maxRequestBytes) {
+            sendJsonText(res, 413, "{\"error\":\"payload_too_large\"}");
             return;
         }
 
-        auto parsed = parse_json<Json>(c->body());
+        auto parsed = parse_json<Json>(httpReq.body);
         if (!parsed) {
-            sendJsonText(c->writer, 400,
+            sendJsonText(res, 400,
                          slimr::write_json(*app_.makeErrorResponse(std::nullopt, McpErrorCode::ParseError, "Parse error")));
             return;
         }
         const Json &req = *parsed;
         if (!req.is_object()) {
-            sendJsonText(c->writer, 400,
+            sendJsonText(res, 400,
                          slimr::write_json(*app_.makeErrorResponse(std::nullopt, McpErrorCode::InvalidRequest, "Invalid Request: expected JSON object")));
             return;
         }
@@ -832,46 +747,46 @@ class McpHttpServer {
             std::optional<Json> errId;
             if (req.contains("id") && mcp_detail::is_valid_rpc_id(req["id"]))
                 errId = req["id"];
-            sendJsonText(c->writer, 400,
+            sendJsonText(res, 400,
                          slimr::write_json(*app_.makeErrorResponse(errId, McpErrorCode::InvalidRequest, "Invalid Request")));
             return;
         }
 
         const bool hasId = req.contains("id");
         if (hasId && !mcp_detail::is_valid_rpc_id(req["id"])) {
-            sendJsonText(c->writer, 400,
+            sendJsonText(res, 400,
                          slimr::write_json(*app_.makeErrorResponse(std::nullopt, McpErrorCode::InvalidRequest, "Invalid Request: id must be a non-null string or number")));
             return;
         }
         std::optional<Json> id = hasId ? std::optional<Json>(req["id"]) : std::nullopt;
 
         if (!req.contains("method") || !req["method"].is_string() || req["method"].get<std::string>().empty()) {
-            sendJsonText(c->writer, 400,
+            sendJsonText(res, 400,
                          slimr::write_json(*app_.makeErrorResponse(id, McpErrorCode::InvalidRequest, "Invalid Request: method must be a non-empty string")));
             return;
         }
         std::string method = req["method"].get<std::string>();
 
-        if (hasId && !mcp_detail::accepts_streamable_http(c->header("Accept"))) {
-            sendJsonText(c->writer, 406, "{\"error\":\"not_acceptable\",\"error_description\":\"Accept must include application/json and text/event-stream\"}");
+        if (hasId && !mcp_detail::accepts_streamable_http(httpReq.get_header_value("Accept"))) {
+            sendJsonText(res, 406, "{\"error\":\"not_acceptable\",\"error_description\":\"Accept must include application/json and text/event-stream\"}");
             return;
         }
 
         Principal principal;
         const bool isDiscover = hasId && method == "server/discover";
         if (opts_.oauth.enabled && !(isDiscover && !opts_.oauth.protectDiscover)) {
-            HttpRouteRequest rreq = toRouteRequest(c);
+            HttpRouteRequest rreq = toRouteRequest(httpReq);
             TokenValidationResult authRes = mcp_detail::evaluate_bearer_auth(opts_.oauth, mcpEndpointUrl(), rreq);
             if (authRes.status == TokenValidationResult::Status::ServiceUnavailable) {
-                sendJsonText(c->writer, 503, "{\"error\":\"service_unavailable\",\"error_description\":\"" + authRes.errorDescription + "\"}");
+                sendJsonText(res, 503, "{\"error\":\"service_unavailable\",\"error_description\":\"" + authRes.errorDescription + "\"}");
                 return;
             }
             if (authRes.status == TokenValidationResult::Status::InvalidToken) {
-                sendOAuthUnauthorized(c->writer, authRes.requiredScopes, authRes.errorDescription);
+                sendOAuthUnauthorized(res, authRes.requiredScopes, authRes.errorDescription);
                 return;
             }
             if (authRes.status == TokenValidationResult::Status::InsufficientScope) {
-                sendOAuthInsufficientScope(c->writer, authRes.requiredScopes, authRes.errorDescription);
+                sendOAuthInsufficientScope(res, authRes.requiredScopes, authRes.errorDescription);
                 return;
             }
             principal = std::move(authRes.principal);
@@ -879,13 +794,13 @@ class McpHttpServer {
 
         if (!hasId) {
             // Notification accepted (no header-mirroring requirements in MCP 2026-07-28).
-            sendResponse(c->writer, 202, "application/json", "");
+            sendResponse(res, 202, "application/json", "");
             return;
         }
 
         if (method == "initialize") {
             Json err = app_.dispatchMcpJson(req);
-            sendJsonText(c->writer, 404, slimr::write_json(err));
+            sendJsonText(res, 404, slimr::write_json(err));
             return;
         }
 
@@ -897,18 +812,18 @@ class McpHttpServer {
             !req["params"]["_meta"].contains("io.modelcontextprotocol/clientCapabilities") ||
             !req["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"].is_object()) {
             Json err = app_.dispatchMcpJson(req);
-            sendJsonText(c->writer, 400, slimr::write_json(err));
+            sendJsonText(res, 400, slimr::write_json(err));
             return;
         }
-        if (auto hdrErr = validateHttpMcpHeaders(req, c, method)) {
+        if (auto hdrErr = validateHttpMcpHeaders(req, httpReq, method)) {
             Json err = *app_.makeErrorResponse(id, McpErrorCode::HeaderMismatch, *hdrErr);
-            sendJsonText(c->writer, 400, slimr::write_json(err));
+            sendJsonText(res, 400, slimr::write_json(err));
             return;
         }
         std::string reqVer = req["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].get<std::string>();
         if (reqVer != kMcpProtocolVersion) {
             Json err = app_.dispatchMcpJson(req);
-            sendJsonText(c->writer, 400, slimr::write_json(err));
+            sendJsonText(res, 400, slimr::write_json(err));
             return;
         }
 
@@ -917,94 +832,61 @@ class McpHttpServer {
             RequestContext baseCtx;
             baseCtx.principal = principal;
             Json resp = app_.dispatchMcpJson(req, baseCtx);
-            sendJsonText(c->writer, 200, slimr::write_json(resp));
+            sendJsonText(res, 200, slimr::write_json(resp));
             return;
         }
 
         if (method != "tools/call" && method != "resources/read") {
             Json err = app_.dispatchMcpJson(req);
-            sendJsonText(c->writer, 404, slimr::write_json(err));
+            sendJsonText(res, 404, slimr::write_json(err));
             return;
         }
 
-        dispatchToolOrResourceAsync(c, req, std::move(principal));
+        dispatchToolOrResourceSync(httpReq, res, req, std::move(principal));
     }
 
-    void dispatchToolOrResourceAsync(const HttpContextPtr &c,
-                                     const Json &req,
-                                     Principal principal) {
-        auto loop = loop_.lock();
-        if (!loop) {
-            sendJsonText(c->writer, 503, "{\"error\":\"server_stopping\"}");
-            return;
-        }
-
+    void dispatchToolOrResourceSync(const httplib::Request &httpReq,
+                                    httplib::Response &res,
+                                    const Json &req,
+                                    Principal principal) {
         struct StreamSession {
-            HttpResponseWriterPtr writer;
-            std::shared_ptr<hv::EventLoop> loop;
+            std::mutex mu;
+            std::condition_variable cv;
+            std::deque<std::string> sseEvents;
             CancellationSource cancelSrc;
-            std::mutex sseMu;
-            bool sseStarted{false};
+            bool sseMode{false};
             bool finished{false};
+            bool closed{false};
+            Json finalResp;
             size_t droppedNotifications{0};
         };
 
         auto sess = std::make_shared<StreamSession>();
-        sess->writer = c->writer;
-        sess->loop = loop;
-        if (std::in_range<int>(opts_.sseMaxWriteBufBytes)) {
-            c->writer->setMaxWriteBufsize(opts_.sseMaxWriteBufBytes);
-        }
-
-        c->writer->onclose = [sess]() {
-            sess->cancelSrc.cancel();
-            std::lock_guard lk(sess->sseMu);
-            sess->finished = true;
-            if (sess->writer) {
-                sess->writer->onclose = nullptr;
-            }
-        };
-
-        auto startSseOnLoop = [sess]() {
-            if (!sess->writer || !sess->writer->isOpened() || sess->cancelSrc.isCancelled())
-                return false;
-            if (!sess->sseStarted) {
-                sess->sseStarted = true;
-                sess->writer->Begin();
-                sess->writer->WriteStatus(HTTP_STATUS_OK);
-                sess->writer->WriteHeader("Content-Type", "text/event-stream");
-                sess->writer->WriteHeader("Cache-Control", "no-cache");
-                sess->writer->WriteHeader("X-Accel-Buffering", "no");
-                sess->writer->EndHeaders("Transfer-Encoding", "chunked");
-            }
-            return true;
-        };
-
         const size_t highWater = opts_.sseHighWaterBytes;
         auto notifyChannel = std::make_shared<McpNotificationChannel>(
-            [sess, startSseOnLoop, highWater](const Json &notif) {
+            [sess, highWater](const Json &notif) {
                 if (sess->cancelSrc.isCancelled())
                     return;
                 std::string raw = slimr::write_json(notif);
                 std::erase(raw, '\n');
                 std::erase(raw, '\r');
                 std::string eventPayload = "data: " + raw + "\n\n";
-                sess->loop->queueInLoop([sess, startSseOnLoop, highWater, payload = std::move(eventPayload)]() {
-                    if (sess->cancelSrc.isCancelled() || !sess->writer || !sess->writer->isOpened())
+                {
+                    std::lock_guard lk(sess->mu);
+                    if (sess->finished || sess->closed)
                         return;
-                    std::lock_guard lk(sess->sseMu);
-                    if (sess->finished)
-                        return;
-                    if (!startSseOnLoop())
-                        return;
-                    if (sess->writer->writeBufsize() >= highWater) {
+                    sess->sseMode = true;
+                    size_t queuedBytes = 0;
+                    for (const auto &ev : sess->sseEvents) {
+                        queuedBytes += ev.size();
+                    }
+                    if (queuedBytes >= highWater) {
                         ++sess->droppedNotifications;
-                        return;
+                    } else {
+                        sess->sseEvents.push_back(std::move(eventPayload));
                     }
-                    if (std::in_range<int>(payload.size())) {
-                        sess->writer->WriteChunked(payload.c_str(), static_cast<int>(payload.size()));
-                    }
-                });
+                }
+                sess->cv.notify_all();
             });
 
         auto job = [this, sess, req, principal = std::move(principal), notifyChannel]() mutable {
@@ -1030,60 +912,12 @@ class McpHttpServer {
 
             notifyChannel->close();
 
-            sess->loop->queueInLoop([this, sess, resp = std::move(resp)]() {
-                if (sess->cancelSrc.isCancelled() || !sess->writer || !sess->writer->isOpened()) {
-                    if (sess->writer)
-                        sess->writer->onclose = nullptr;
-                    sess->writer.reset();
-                    return;
-                }
-
-                std::lock_guard lk(sess->sseMu);
+            {
+                std::lock_guard lk(sess->mu);
+                sess->finalResp = std::move(resp);
                 sess->finished = true;
-
-                if (sess->sseStarted) {
-                    std::string raw = slimr::write_json(resp);
-                    std::erase(raw, '\n');
-                    std::erase(raw, '\r');
-                    std::string frame = "data: " + raw + "\n\n";
-                    if (std::in_range<int>(frame.size())) {
-                        sess->writer->WriteChunked(frame.c_str(), static_cast<int>(frame.size()));
-                    }
-                    sess->writer->End();
-                    sess->writer->onclose = nullptr;
-                    sess->writer.reset();
-                    return;
-                }
-
-                int httpCode = 200;
-                if (resp.contains("error") && resp["error"].is_object() &&
-                    resp["error"].contains("code") && resp["error"]["code"].is_int64()) {
-                    int rpcCode = static_cast<int>(resp["error"]["code"].get<int64_t>());
-                    if (rpcCode == McpErrorCode::InsufficientScope) {
-                        std::vector<std::string> reqScopes;
-                        if (resp["error"].contains("data") && resp["error"]["data"].is_object() &&
-                            resp["error"]["data"].contains("requiredScopes") &&
-                            resp["error"]["data"]["requiredScopes"].is_array()) {
-                            for (const auto &sc : resp["error"]["data"]["requiredScopes"].get_array()) {
-                                if (sc.is_string())
-                                    reqScopes.push_back(sc.get<std::string>());
-                            }
-                        }
-                        std::string desc = resp["error"].contains("message") && resp["error"]["message"].is_string()
-                                               ? resp["error"]["message"].get<std::string>()
-                                               : "Insufficient scope";
-                        sendOAuthInsufficientScope(sess->writer, reqScopes, desc);
-                        sess->writer->onclose = nullptr;
-                        sess->writer.reset();
-                        return;
-                    }
-                    httpCode = httpStatusForRpcError(rpcCode);
-                }
-
-                sendJsonText(sess->writer, httpCode, slimr::write_json(resp));
-                sess->writer->onclose = nullptr;
-                sess->writer.reset();
-            });
+            }
+            sess->cv.notify_all();
         };
 
         {
@@ -1091,15 +925,13 @@ class McpHttpServer {
             if (workerState_->rejectNew || workerState_->stopping ||
                 workerState_->queue.size() >= opts_.maxPendingJobs) {
                 notifyChannel->close();
-                sendResponse(c->writer, 503, "application/json",
+                sendResponse(res, 503, "application/json",
                              "{\"error\":\"server_busy\",\"error_description\":\"Worker queue full\"}",
                              {{"Retry-After", "1"}});
-                c->writer->onclose = nullptr;
                 return;
             }
-            // Note: track cancelSrc weakly so stop() can cooperatively cancel long-running tools past timeout.
+            ++workerState_->inFlightResponses;
             std::erase_if(workerState_->activeCancels, [](const auto &w) { return w.expired(); });
-            // Keep a shared alias inside the queued task so weak_ptr stays valid while executing.
             auto cancelHandle = std::make_shared<CancellationSource>(sess->cancelSrc);
             workerState_->activeCancels.push_back(cancelHandle);
             workerState_->queue.push_back([job = std::move(job), cancelHandle]() mutable {
@@ -1108,6 +940,128 @@ class McpHttpServer {
             });
         }
         workerState_->cv.notify_one();
+
+        auto releaseResponseSlot = [state = workerState_]() {
+            std::lock_guard lock(state->mu);
+            if (state->inFlightResponses > 0)
+                --state->inFlightResponses;
+            if (state->inFlightResponses == 0)
+                state->responsesCv.notify_all();
+        };
+
+        bool startSse = false;
+        bool aborted = false;
+        Json respCopy;
+        {
+            std::unique_lock lk(sess->mu);
+            while (!sess->sseMode && !sess->finished) {
+                if (httpReq.is_connection_closed()) {
+                    sess->cancelSrc.cancel();
+                    sess->closed = true;
+                    aborted = true;
+                    break;
+                }
+                sess->cv.wait_for(lk, std::chrono::milliseconds(10));
+            }
+            if (!aborted) {
+                startSse = sess->sseMode;
+                if (!startSse && sess->finished) {
+                    respCopy = std::move(sess->finalResp);
+                }
+            }
+        }
+
+        if (aborted) {
+            releaseResponseSlot();
+            return;
+        }
+
+        if (startSse) {
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [sess](size_t, httplib::DataSink &sink) {
+                    std::deque<std::string> batch;
+                    bool isDone = false;
+                    Json finalResp;
+                    {
+                        std::unique_lock lk(sess->mu);
+                        while (sess->sseEvents.empty() && !sess->finished) {
+                            if (!sink.is_writable() || sess->cancelSrc.isCancelled()) {
+                                sess->cancelSrc.cancel();
+                                sess->closed = true;
+                                return false;
+                            }
+                            sess->cv.wait_for(lk, std::chrono::milliseconds(10));
+                        }
+                        if (!sink.is_writable() || sess->cancelSrc.isCancelled()) {
+                            sess->cancelSrc.cancel();
+                            sess->closed = true;
+                            return false;
+                        }
+                        batch.swap(sess->sseEvents);
+                        if (sess->finished) {
+                            isDone = true;
+                            finalResp = std::move(sess->finalResp);
+                        }
+                    }
+                    for (const auto &ev : batch) {
+                        if (!sink.write(ev.data(), ev.size())) {
+                            sess->cancelSrc.cancel();
+                            return false;
+                        }
+                    }
+                    if (isDone) {
+                        std::string raw = slimr::write_json(finalResp);
+                        std::erase(raw, '\n');
+                        std::erase(raw, '\r');
+                        std::string frame = "data: " + raw + "\n\n";
+                        if (!sink.write(frame.data(), frame.size())) {
+                            sess->cancelSrc.cancel();
+                            return false;
+                        }
+                        sink.done();
+                    }
+                    return true;
+                },
+                [releaseResponseSlot](bool) {
+                    releaseResponseSlot();
+                });
+            return;
+        }
+
+        if (sess->cancelSrc.isCancelled()) {
+            releaseResponseSlot();
+            return;
+        }
+
+        int httpCode = 200;
+        if (respCopy.contains("error") && respCopy["error"].is_object() &&
+            respCopy["error"].contains("code") && respCopy["error"]["code"].is_int64()) {
+            int rpcCode = static_cast<int>(respCopy["error"]["code"].get<int64_t>());
+            if (rpcCode == McpErrorCode::InsufficientScope) {
+                std::vector<std::string> reqScopes;
+                if (respCopy["error"].contains("data") && respCopy["error"]["data"].is_object() &&
+                    respCopy["error"]["data"].contains("requiredScopes") &&
+                    respCopy["error"]["data"]["requiredScopes"].is_array()) {
+                    for (const auto &sc : respCopy["error"]["data"]["requiredScopes"].get_array()) {
+                        if (sc.is_string())
+                            reqScopes.push_back(sc.get<std::string>());
+                    }
+                }
+                std::string desc = respCopy["error"].contains("message") && respCopy["error"]["message"].is_string()
+                                       ? respCopy["error"]["message"].get<std::string>()
+                                       : "Insufficient scope";
+                sendOAuthInsufficientScope(res, reqScopes, desc);
+                releaseResponseSlot();
+                return;
+            }
+            httpCode = httpStatusForRpcError(rpcCode);
+        }
+
+        sendJsonText(res, httpCode, slimr::write_json(respCopy));
+        releaseResponseSlot();
     }
 
     void startWorkers() {
@@ -1167,12 +1121,10 @@ class McpHttpServer {
     std::atomic<bool> running_{false};
     std::atomic<bool> draining_{false};
     std::atomic<uint16_t> boundPort_{0};
-    std::unique_ptr<hv::HttpService> service_;
-    std::unique_ptr<hv::HttpServer> server_;
-    std::weak_ptr<hv::EventLoop> loop_;
+    std::unique_ptr<httplib::Server> svr_;
+    std::thread acceptThread_;
     std::shared_ptr<WorkerState> workerState_;
     std::vector<std::thread> workers_;
-    std::vector<std::weak_ptr<hv::HttpResponseWriter>> responseWriters_;
 };
 
 /** Attaches standalone `http [--host <addr>] [--port <n>]` subcommand to PluginApp. */

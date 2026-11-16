@@ -26,8 +26,7 @@ Add `slimr-down-now/mcp` to `vcpkg-configuration.json`:
   "repository": "https://github.com/slimr-down-now/mcp",
   "baseline": "<commit-sha>",
   "packages": [
-    "slimr-mcp",
-    "libhv"
+    "slimr-mcp"
   ]
 }
 ```
@@ -39,7 +38,7 @@ find_package(slimr-mcp CONFIG REQUIRED)
 target_link_libraries(my_target PRIVATE slimr::mcp)
 ```
 
-When using the `"http"` feature, list `"packages": ["slimr-mcp", "libhv"]` on the `slimr-mcp` registry entry so `libhv` resolves from this registry.
+When using the `"http"` feature, `slimr-mcp` pulls `cpp-httplib[openssl]` from the default vcpkg registry.
 
 ## Quick Start
 
@@ -117,21 +116,22 @@ int main(int argc, char** argv) {
 
 ### HTTP shutdown
 
-Call `McpHttpServer::stop()` from the owning thread, outside handlers/event-loop callbacks.
+Call `McpHttpServer::stop()` from the owning thread, outside request handlers.
 Lifecycle calls (`start()`/`stop()`/destruction) must not run concurrently.
-Shutdown closes the listener and rejects new requests on existing connections with
-`503`, including discovery and custom routes. Already admitted jobs have up to
-`shutdownTimeoutMs` (negative values mean zero) to finish naturally. Remaining
-queued and active jobs receive cooperative cancellation; cancelled queued handlers
-are not invoked. Cancelled requests are closed without a final response.
+Shutdown enters drain mode and immediately rejects new requests (on both
+keep-alive and newly accepted connections) with `503` and `Connection: close`,
+including discovery and custom routes. Already admitted jobs have up to
+`shutdownTimeoutMs` (negative values mean zero) to finish naturally and flush
+their final JSON or SSE responses. Remaining queued and active jobs then receive
+cooperative cancellation; cancelled queued handlers are not invoked, and
+cancelled requests are closed without a final response.
 
-Workers are joined while the I/O loop remains alive. A loop barrier processes their
-final-response callbacks, then buffered writes get an additional 50–500 ms to
-drain (`shutdownTimeoutMs` clamped to that range). A flush timeout is reported to
-stderr before remaining connections are closed. Flushing means handing bytes to
-the socket, not confirming client receipt. Handlers must observe cancellation and
-return: the grace period is **not** a hard bound on `stop()` because workers are
-never detached or forcibly terminated.
+Once the drain window ends (or all in-flight jobs and responses finish),
+`stop()` closes the listener, joins the accept thread, and joins the worker
+threads. Socket writes use a 1-second write timeout so stalled clients cannot
+block shutdown indefinitely. Handlers must observe cancellation and return:
+the grace period is **not** a hard bound on `stop()` because workers are never
+detached or forcibly terminated.
 
 ---
 

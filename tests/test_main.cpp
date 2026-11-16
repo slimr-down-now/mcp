@@ -1678,17 +1678,13 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             CHECK(admissionStatus == 503);
-            TcpFd refused;
-            do {
-                refused = connect_loopback(port);
-                if (refused.fd < 0)
-                    break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            } while (std::chrono::steady_clock::now() < deadline);
-            CHECK(refused.fd < 0);
+            const auto newConnReply = http_exchange(port, "POST", "/mcp", mcp_headers("server/discover"),
+                                                    slimr::write_json(make_req(2, "server/discover")));
+            CHECK(newConnReply.status == 503);
             release.store(true);
             const auto raw = read_http_message(conn.fd);
             stopping.join();
+            CHECK(connect_loopback(port).fd < 0);
             CHECK_FALSE(cancelled.load());
             const auto reply = parse_http_reply(raw);
             CHECK(reply.status == 200);

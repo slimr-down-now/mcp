@@ -18,15 +18,27 @@
   ],
   "features": {
     "http": {
-      "description": "Streamable HTTP and OAuth resource-server support via libhv",
+      "description": "Streamable HTTP and OAuth resource-server support via cpp-httplib",
       "dependencies": [
-        "libhv"
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        }
       ]
     },
     "tests": {
       "description": "Dependencies for the standalone test suite",
       "dependencies": [
-        "libhv",
+        {
+          "name": "cpp-httplib",
+          "default-features": false,
+          "features": [
+            "openssl"
+          ]
+        },
         {
           "name": "slimr-test",
           "version>=": "0.1.1"
