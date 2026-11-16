@@ -1,6 +1,6 @@
 {
   "name": "slimr-mcp",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Header-only typed MCP servers and JSON CLIs",
   "dependencies": [
     {
