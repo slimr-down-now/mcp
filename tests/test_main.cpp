@@ -563,6 +563,314 @@ TEST_SUITE("MCP 2026-07-28 Protocol, Context & Stdio") {
         unsetenv("SLIMR_TEST_REQ_A");
         unsetenv("SLIMR_TEST_REQ_B");
     }
+
+    TEST_CASE("redact_json, Principal::hasAllScopes, CancellationToken, and emitLog levels") {
+        // redact_json recursively redacts sensitive keys, arrays, and secret-bearing strings
+        Json input = json_obj();
+        input["authorization"] = "Bearer topsecret";
+        input["x-api-key"] = "key-123";
+        input["password"] = "hunter2";
+        input["safe_url"] = "https://example.com/cb?access_token=tok1&my_token=keep&code=c1";
+        input["basic_auth"] = "Basic dXNlcjpwYXNz";
+        input["count"] = 42;
+        Json nested = json_obj();
+        nested["client_secret"] = "sec";
+        nested["note"] = "hello";
+        input["nested"] = std::move(nested);
+        Json::array_t arr;
+        arr.emplace_back("Bearer arrtok");
+        arr.emplace_back(7);
+        input["arr"] = json_arr(std::move(arr));
+
+        Json redacted = redact_json(input);
+        CHECK(redacted["authorization"].get<std::string>() == "[REDACTED]");
+        CHECK(redacted["x-api-key"].get<std::string>() == "[REDACTED]");
+        CHECK(redacted["password"].get<std::string>() == "[REDACTED]");
+        CHECK(redacted["safe_url"].get<std::string>().find("tok1") == std::string::npos);
+        CHECK(redacted["safe_url"].get<std::string>().find("my_token=keep") != std::string::npos);
+        CHECK(redacted["basic_auth"].get<std::string>() == "Basic [REDACTED]");
+        CHECK(redacted["count"].get<int64_t>() == 42);
+        CHECK(redacted["nested"]["client_secret"].get<std::string>() == "[REDACTED]");
+        CHECK(redacted["nested"]["note"].get<std::string>() == "hello");
+        CHECK(redacted["arr"][0].get<std::string>() == "Bearer [REDACTED]");
+        CHECK(redacted["arr"][1].get<int64_t>() == 7);
+
+        // Principal::hasAllScopes overloads
+        Principal p;
+        p.authenticated = true;
+        p.scopes = {"read", "write"};
+        std::vector<std::string_view> reqSvOk{"read", "write"};
+        std::vector<std::string_view> reqSvMissing{"read", "admin"};
+        std::vector<std::string> reqStrOk{"read"};
+        std::vector<std::string> reqStrMissing{"admin"};
+        CHECK(p.hasAllScopes(reqSvOk));
+        CHECK_FALSE(p.hasAllScopes(reqSvMissing));
+        CHECK(p.hasAllScopes(reqStrOk));
+        CHECK_FALSE(p.hasAllScopes(reqStrMissing));
+
+        // CancellationToken & CancellationSource edge paths
+        CancellationToken emptyTok;
+        CHECK_FALSE(emptyTok.isCancelled());
+        CHECK(emptyTok.onCancel([]() {}) == 0);
+        emptyTok.removeOnCancel(0);
+
+        CancellationSource src;
+        auto tok = src.token();
+        CHECK(tok.onCancel(nullptr) == 0);
+        int removedCalls = 0;
+        uint64_t remId = tok.onCancel([&]() { ++removedCalls; });
+        CHECK(remId != 0);
+        tok.removeOnCancel(remId);
+        int keptCalls = 0;
+        (void)tok.onCancel([&]() { ++keptCalls; });
+        (void)tok.onCancel([]() { throw std::runtime_error("cb boom"); });
+        src.cancel();
+        src.cancel(); // idempotent second cancel
+        CHECK(src.isCancelled());
+        CHECK(tok.isCancelled());
+        CHECK(removedCalls == 0);
+        CHECK(keptCalls == 1);
+
+        int afterCalls = 0;
+        CHECK(tok.onCancel([&]() {
+            ++afterCalls;
+            throw std::runtime_error("late boom");
+        }) == 0);
+        CHECK(afterCalls == 1);
+
+        // RequestContext::emitLog across all severity levels and gating
+        std::vector<std::string> emittedLevels;
+        auto ch = std::make_shared<McpNotificationChannel>([&](const Json &n) {
+            if (n["method"].get<std::string>() == "notifications/message") {
+                emittedLevels.push_back(n["params"]["level"].get<std::string>());
+            }
+        });
+        RequestContext ctx;
+        ctx.notificationChannel = ch;
+        ctx.emitLog("error", "suppressed");
+        CHECK(emittedLevels.empty());
+
+        ctx.minLogLevel = "notice";
+        for (const char *lvl : {"debug", "info", "notice", "warning", "error", "critical", "alert", "emergency", "unknown"}) {
+            ctx.emitLog(lvl, "msg");
+        }
+        CHECK(emittedLevels == std::vector<std::string>{"notice", "warning", "error", "critical", "alert", "emergency"});
+
+        // McpResult helpers
+        Json obj = json_obj();
+        obj["ok"] = true;
+        auto rStructDefault = McpResult::structured(obj);
+        CHECK(rStructDefault.toJson()["structuredContent"]["ok"].get<bool>() == true);
+        auto rStructFallback = McpResult::structured(obj, "fallback");
+        CHECK(rStructFallback.toJson()["content"][0]["text"].get<std::string>() == "fallback");
+        auto rAudio = McpResult::audio("AAAA", "audio/wav");
+        CHECK(rAudio.toJson()["content"][0]["type"].get<std::string>() == "audio");
+        auto rInputNoState = McpResult::inputRequired(json_obj());
+        CHECK(rInputNoState.toJson()["resultType"].get<std::string>() == "input_required");
+        CHECK_FALSE(rInputNoState.toJson().contains("requestState"));
+    }
+
+    TEST_CASE("PluginApp tool variants, exception handling, authorization, and dispatch errors") {
+        PluginApp app("edge-app", "0.1.0");
+        app.defaultRequiredScopes = {"base"};
+        app.authorizer = [](const Principal &p, std::string_view op, std::string &errOut) -> bool {
+            if (p.subject == "deny-custom") {
+                errOut = "custom deny for " + std::string(op);
+                return false;
+            }
+            if (p.subject == "deny-empty") {
+                return false;
+            }
+            return true;
+        };
+
+        ToolAnnotations ann;
+        ann.readOnlyHint = true;
+        ann.destructiveHint = false;
+        ann.idempotentHint = true;
+        ann.openWorldHint = false;
+        app.tool<AddInput>("my_add", "Adds", ann, [](const AddInput &in) {
+            return std::to_string(in.a.get() + in.b.get());
+        });
+        app.tool<SecretInput>("my-hyphen", "Hyphenated", [](const SecretInput &) {});
+        app.tool<SecretInput>("void_tool", "Void", [](const SecretInput &) {});
+        app.tool<SecretInput>("proto_err", "Proto err", [](const SecretInput &) -> McpResult {
+            throw McpProtocolException(McpErrorCode::InvalidParams, "bad proto input");
+        });
+        app.tool<SecretInput>("std_err", "Std err", [](const SecretInput &) -> McpResult {
+            throw std::runtime_error("boom Bearer secret123");
+        });
+        app.tool<SecretInput>("unk_err", "Unknown err", [](const SecretInput &) -> McpResult {
+            throw 42;
+        });
+
+        app.resources.push_back(Resource{
+            .uri = "test://ok",
+            .name = "ok",
+            .description = "ok",
+            .mimeType = "text/plain",
+            .load = []() { return "ok"; },
+            .requiredScopes = {"res:read"}});
+        app.resources.push_back(Resource{
+            .uri = "test://proto",
+            .name = "proto",
+            .description = "proto",
+            .mimeType = "text/plain",
+            .load = []() -> std::string { throw McpProtocolException(McpErrorCode::InternalError, "res proto"); }});
+        app.resources.push_back(Resource{
+            .uri = "test://boom",
+            .name = "boom",
+            .description = "boom",
+            .mimeType = "text/plain",
+            .load = []() -> std::string { throw std::runtime_error("res Bearer tok"); }});
+
+        // findTool normalization (hyphens/underscores) and tools/list annotations
+        CHECK(app.findTool("my-add") != nullptr);
+        CHECK(app.findTool("my_hyphen") != nullptr);
+        Json listResp = app.dispatchMcpJson(make_req(1, "tools/list"));
+        bool foundMyAddAnn = false;
+        for (const auto &t : listResp["result"]["tools"].get_array()) {
+            if (t["name"].get<std::string>() == "my_add") {
+                foundMyAddAnn = t["annotations"]["readOnlyHint"].get<bool>();
+            }
+        }
+        CHECK(foundMyAddAnn);
+
+        // dispatchMcpJson validation errors
+        CHECK(app.dispatchMcpJson(Json(123))["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
+        Json badVer = make_req(Json(true), "tools/list");
+        CHECK(app.dispatchMcpJson(badVer)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
+        Json badJsonRpc = make_req(2, "tools/list");
+        badJsonRpc["jsonrpc"] = "1.0";
+        CHECK(app.dispatchMcpJson(badJsonRpc)["id"].get<int64_t>() == 2);
+        Json emptyMethod = make_req(3, "");
+        CHECK(app.dispatchMcpJson(emptyMethod)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidRequest);
+        Json unknownMethod = make_req(4, "no/suchMethod");
+        CHECK(app.dispatchMcpJson(unknownMethod)["error"]["code"].get<int64_t>() == McpErrorCode::MethodNotFound);
+
+        // tools/call validation and exception paths
+        Json noName = make_req(5, "tools/call", json_obj());
+        CHECK(app.dispatchMcpJson(noName)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidParams);
+
+        auto callTool = [&](std::string_view name, Json args, const RequestContext &ctx = RequestContext{}) {
+            Json p = json_obj();
+            p["name"] = std::string(name);
+            p["arguments"] = std::move(args);
+            return app.dispatchMcpJson(make_req(6, "tools/call", std::move(p)), ctx);
+        };
+        Json msgArgs = json_obj();
+        msgArgs["msg"] = "hi";
+        CHECK(callTool("void_tool", msgArgs)["result"]["isError"].get<bool>() == false);
+        CHECK(callTool("proto_err", msgArgs)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidParams);
+        Json stdErrRes = callTool("std_err", msgArgs);
+        CHECK(stdErrRes["result"]["isError"].get<bool>() == true);
+        CHECK(stdErrRes["result"]["content"][0]["text"].get<std::string>().find("secret123") == std::string::npos);
+        CHECK(callTool("unk_err", msgArgs)["result"]["isError"].get<bool>() == true);
+
+        // Authorization scopes and authorizer callback
+        RequestContext noScopeCtx;
+        noScopeCtx.principal.authenticated = true;
+        CHECK(callTool("void_tool", msgArgs, noScopeCtx)["error"]["code"].get<int64_t>() == McpErrorCode::InsufficientScope);
+
+        RequestContext customDenyCtx;
+        customDenyCtx.principal.authenticated = true;
+        customDenyCtx.principal.subject = "deny-custom";
+        customDenyCtx.principal.scopes = {"base", "res:read"};
+        CHECK(callTool("void_tool", msgArgs, customDenyCtx)["error"]["message"].get<std::string>().find("custom deny") != std::string::npos);
+
+        RequestContext emptyDenyCtx = customDenyCtx;
+        emptyDenyCtx.principal.subject = "deny-empty";
+        CHECK(callTool("void_tool", msgArgs, emptyDenyCtx)["error"]["message"].get<std::string>() == "Forbidden");
+
+        // resources/read and mcp_resource_read error paths
+        CHECK(app.dispatchMcpJson(make_req(7, "resources/read", json_obj()))["error"]["code"].get<int64_t>() == McpErrorCode::InvalidParams);
+        Json rProto = json_obj();
+        rProto["uri"] = "test://proto";
+        CHECK(app.dispatchMcpJson(make_req(8, "resources/read", rProto))["error"]["code"].get<int64_t>() == McpErrorCode::InternalError);
+        Json rBoom = json_obj();
+        rBoom["uri"] = "test://boom";
+        Json rBoomResp = app.dispatchMcpJson(make_req(9, "resources/read", rBoom));
+        CHECK(rBoomResp["error"]["code"].get<int64_t>() == McpErrorCode::InternalError);
+        CHECK(rBoomResp["error"]["message"].get<std::string>().find("tok") == std::string::npos);
+
+        Json rOk = json_obj();
+        rOk["uri"] = "test://ok";
+        CHECK(app.dispatchMcpJson(make_req(10, "resources/read", rOk), noScopeCtx)["error"]["code"].get<int64_t>() == McpErrorCode::InsufficientScope);
+
+        CHECK(callTool("mcp_resource_read", json_obj())["error"]["code"].get<int64_t>() == McpErrorCode::InvalidParams);
+        Json unknownUri = json_obj();
+        unknownUri["uri"] = "test://missing";
+        CHECK(callTool("mcp_resource_read", unknownUri)["error"]["code"].get<int64_t>() == McpErrorCode::InvalidParams);
+        CHECK(callTool("mcp_resource_read", rOk, noScopeCtx)["error"]["code"].get<int64_t>() == McpErrorCode::InsufficientScope);
+        CHECK(callTool("mcp_resource_read", rProto)["error"]["code"].get<int64_t>() == McpErrorCode::InternalError);
+        CHECK(callTool("mcp_resource_read", rBoom)["result"]["isError"].get<bool>() == true);
+    }
+
+    TEST_CASE("Stdio transport edge cases and CLI run branches") {
+        PluginApp app("cli-app", "0.2.0");
+        app.tool<AddInput>("add", "Adds", [](const AddInput &in) {
+            return std::to_string(in.a.get() + in.b.get());
+        });
+        app.tool<SecretInput>("fail", "Fails", [](const SecretInput &) {
+            return McpResult::error("tool failed");
+        });
+        app.tool<SecretInput>("img", "Image", [](const SecretInput &) {
+            return McpResult::image("AQID", "image/png");
+        });
+        app.tool<SecretInput>("boom", "Boom", [](const SecretInput &) -> McpResult {
+            throw std::runtime_error("cli Bearer secret");
+        });
+
+        // serveMcpStdio: blank lines, malformed JSON, CRLF, and notification without id
+        std::string cancelNotif = R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}})";
+        std::istringstream in("\n   \r\nnot-json\r\n" + cancelNotif + "\n" +
+                              slimr::write_json(make_req("s1", "server/discover")) + "\r\n");
+        std::ostringstream out;
+        std::ostringstream err;
+        app.serveMcpStdio(in, out, err);
+        CHECK(out.str().find("-32700") != std::string::npos);
+        CHECK(out.str().find("\"id\":\"s1\"") != std::string::npos);
+
+        // CLI run() branches with redirected cout/cerr
+        auto runCli = [&](std::initializer_list<const char *> args, std::string *outBuf = nullptr, std::string *errBuf = nullptr) {
+            std::vector<std::string> storage;
+            std::vector<char *> argv;
+            for (const char *a : args)
+                storage.emplace_back(a);
+            for (auto &s : storage)
+                argv.push_back(s.data());
+
+            std::ostringstream capOut;
+            std::ostringstream capErr;
+            auto *oldOut = std::cout.rdbuf(capOut.rdbuf());
+            auto *oldErr = std::cerr.rdbuf(capErr.rdbuf());
+            int rc = app.run(static_cast<int>(argv.size()), argv.data());
+            std::cout.rdbuf(oldOut);
+            std::cerr.rdbuf(oldErr);
+            if (outBuf)
+                *outBuf = capOut.str();
+            if (errBuf)
+                *errBuf = capErr.str();
+            return rc;
+        };
+
+        std::string o;
+        std::string e;
+        CHECK(runCli({"cli-app", "--help"}, &o) == 0);
+        CHECK(o.find("Available tools:") != std::string::npos);
+        CHECK(runCli({"cli-app", "http"}, nullptr, &e) == 1);
+        CHECK(e.find("HTTP transport is not enabled") != std::string::npos);
+        CHECK(runCli({"cli-app", "unknown"}, &o, &e) == 1);
+        CHECK(e.find("Unknown tool") != std::string::npos);
+        CHECK(runCli({"cli-app", "add", "{bad"}, nullptr, &e) == 1);
+        CHECK(e.find("Invalid JSON arguments") != std::string::npos);
+        CHECK(runCli({"cli-app", "fail", R"({"msg":"x"})"}, nullptr, &e) == 1);
+        CHECK(e.find("tool failed") != std::string::npos);
+        CHECK(runCli({"cli-app", "img", R"({"msg":"x"})"}, &o) == 0);
+        CHECK(o.find("image/png") != std::string::npos);
+        CHECK(runCli({"cli-app", "boom", R"({"msg":"x"})"}, nullptr, &e) == 1);
+        CHECK(e.find("Bearer [REDACTED]") != std::string::npos);
+    }
 }
 
 #ifdef SLIMR_MCP_HAS_HTTP
@@ -1545,6 +1853,263 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         CHECK(cancelled.load() == true);
         CHECK(queuedCalls.load() == 0);
         CHECK(elapsedMs < 2000);
+    }
+
+    TEST_CASE("Streamable HTTP options validation, error status lanes, custom routes, and runUntilSignal") {
+        PluginApp app("http-edge", "1.0.0");
+        app.tool<AddInput>("add", "Adds", [](const AddInput &in) {
+            return std::to_string(in.a.get() + in.b.get());
+        });
+
+        // Option validation failures
+        {
+            HttpServerOptions badPort;
+            badPort.host = "127.0.0.1";
+            badPort.port = -1;
+            McpHttpServer srv(app, badPort);
+            std::string err;
+            CHECK_FALSE(srv.start(&err));
+            CHECK(err.find("Invalid port") != std::string::npos);
+
+            badPort.port = 70000;
+            McpHttpServer srvHigh(app, badPort);
+            CHECK_FALSE(srvHigh.start(&err));
+            CHECK(err.find("Invalid port") != std::string::npos);
+
+            HttpServerOptions badPath;
+            badPath.host = "127.0.0.1";
+            badPath.port = 0;
+            badPath.mcpPath = "mcp";
+            McpHttpServer srvPath(app, badPath);
+            CHECK_FALSE(srvPath.start(&err));
+            CHECK(err.find("mcpPath") != std::string::npos);
+        }
+
+        // Custom routes, error status lanes (405/415/413/400/406/404/500), and runUntilSignal
+        HttpServerOptions opts;
+        opts.host = "127.0.0.1";
+        opts.port = 0;
+        opts.maxRequestBytes = 512;
+        opts.customRoutes.push_back(CustomHttpRoute{
+            .method = "GET",
+            .path = "/html",
+            .handler = [](const HttpRouteRequest &r) {
+                auto q = r.query("q");
+                return HttpRouteResponse::html(200, "<p>" + q.value_or("") + "</p>");
+            }});
+        opts.customRoutes.push_back(CustomHttpRoute{
+            .method = "GET",
+            .path = "/redir",
+            .handler = [](const HttpRouteRequest &) {
+                return HttpRouteResponse::redirect("https://example.com/next", 302);
+            }});
+        opts.customRoutes.push_back(CustomHttpRoute{
+            .method = "*",
+            .path = "/any",
+            .handler = [](const HttpRouteRequest &r) {
+                if (r.query("boom").has_value()) {
+                    throw std::runtime_error("route Bearer secret");
+                }
+                if (r.query("unk").has_value()) {
+                    throw 7;
+                }
+                Json j = json_obj();
+                j["method"] = r.method;
+                return HttpRouteResponse::json(200, j);
+            }});
+
+        McpHttpServer srv(app, opts);
+        std::string startErr;
+        REQUIRE(srv.start(&startErr));
+        uint16_t port = srv.boundPort();
+        REQUIRE(port != 0);
+
+        const std::vector<std::pair<std::string, std::string>> mcpHeaders{
+            {"Content-Type", "application/json"},
+            {"Accept", "application/json, text/event-stream"},
+            {"Connection", "close"}};
+
+        // 405 on GET / PUT / DELETE /mcp
+        for (const char *m : {"GET", "PUT", "DELETE"}) {
+            auto r = http_exchange(port, m, "/mcp", {{"Connection", "close"}}, "");
+            CHECK(r.status == 405);
+            CHECK(r.headers["allow"] == "POST");
+        }
+
+        // 415 Unsupported Media Type
+        auto r415 = http_exchange(port, "POST", "/mcp", {{"Content-Type", "text/plain"}, {"Accept", "application/json, text/event-stream"}, {"Connection", "close"}}, "{}");
+        CHECK(r415.status == 415);
+
+        // 413 Payload Too Large
+        std::string huge(600, 'a');
+        auto r413 = http_exchange(port, "POST", "/mcp", mcpHeaders, huge);
+        CHECK(r413.status == 413);
+
+        // 400 Parse error, non-object, bad jsonrpc, invalid id, empty method
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, "{bad").status == 400);
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, "[1,2]").status == 400);
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, R"({"jsonrpc":"1.0","id":1,"method":"tools/list"})").status == 400);
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, R"({"jsonrpc":"2.0","id":true,"method":"tools/list"})").status == 400);
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, R"({"jsonrpc":"2.0","id":1,"method":""})").status == 400);
+
+        // 406 Not Acceptable when Accept lacks text/event-stream
+        auto r406 = http_exchange(port, "POST", "/mcp", {{"Content-Type", "application/json"}, {"Accept", "application/json"}, {"Connection", "close"}},
+                                  slimr::write_json(make_req(1, "tools/list")));
+        CHECK(r406.status == 406);
+
+        // 404 MethodNotFound and 400 UnsupportedProtocolVersion
+        std::vector<std::pair<std::string, std::string>> unknownMethodHeaders = mcpHeaders;
+        unknownMethodHeaders.emplace_back("MCP-Protocol-Version", std::string(kMcpProtocolVersion));
+        unknownMethodHeaders.emplace_back("Mcp-Method", "no/suchMethod");
+        CHECK(http_exchange(port, "POST", "/mcp", unknownMethodHeaders, slimr::write_json(make_req(2, "no/suchMethod"))).status == 404);
+        CHECK(http_exchange(port, "POST", "/mcp", mcpHeaders, slimr::write_json(make_req(3, "tools/list", json_obj(), "2024-01-01"))).status == 400);
+
+        // Custom routes: HTML + URL decoding, redirect, wildcard, 413, 500
+        auto rHtml = http_exchange(port, "GET", "/html?q=a+b%20c%2Fz%ZZ", {{"Connection", "close"}}, "");
+        CHECK(rHtml.status == 200);
+        CHECK(rHtml.body == "<p>a b c/z%ZZ</p>");
+
+        auto rRedir = http_exchange(port, "GET", "/redir", {{"Connection", "close"}}, "");
+        CHECK(rRedir.status == 302);
+        CHECK(rRedir.headers["location"] == "https://example.com/next");
+
+        auto rAny = http_exchange(port, "POST", "/any", {{"Content-Type", "application/json"}, {"Connection", "close"}}, "{}");
+        CHECK(rAny.status == 200);
+        CHECK(rAny.body.find("POST") != std::string::npos);
+
+        auto rAnyBig = http_exchange(port, "POST", "/any", {{"Content-Type", "application/json"}, {"Connection", "close"}}, huge);
+        CHECK(rAnyBig.status == 413);
+
+        auto rAnyBoom = http_exchange(port, "GET", "/any?boom=1", {{"Connection", "close"}}, "");
+        CHECK(rAnyBoom.status == 500);
+        CHECK(rAnyBoom.body.find("secret") == std::string::npos);
+
+        auto rAnyUnk = http_exchange(port, "GET", "/any?unk=1", {{"Connection", "close"}}, "");
+        CHECK(rAnyUnk.status == 500);
+
+        // runUntilSignal exits promptly when stop() is called from another thread
+        std::thread stopper([&]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            srv.stop();
+        });
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(srv.runUntilSignal() == 0);
+        stopper.join();
+        CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < 2000);
+    }
+
+    TEST_CASE("OAuth helpers and evaluate_bearer_auth fail-closed branches") {
+        // base64_decode edge cases
+        CHECK(mcp_detail::base64_decode("").value() == "");
+        CHECK(mcp_detail::base64_decode("Zg==").value() == "f");
+        CHECK(mcp_detail::base64_decode("Zm8=").value() == "fo");
+        CHECK(mcp_detail::base64_decode("Zm9v").value() == "foo");
+        CHECK(mcp_detail::base64_decode("Zm8").value() == "fo");
+        CHECK_FALSE(mcp_detail::base64_decode("Zg=a").has_value());
+        CHECK_FALSE(mcp_detail::base64_decode("ab$d").has_value());
+
+        // OAuthResourceMetadata::toJson
+        OAuthResourceMetadata meta;
+        meta.resource = "https://example.com/mcp";
+        meta.authorizationServers = {"https://auth.example.com"};
+        meta.scopesSupported = {"mcp:read", "mcp:write"};
+        meta.bearerMethodsSupported = {"header"};
+        meta.resourceName = "Example MCP";
+        meta.resourceDocumentation = "https://example.com/docs";
+        Json mj = meta.toJson("https://example.com/mcp");
+        CHECK(mj["resource"].get<std::string>() == "https://example.com/mcp");
+        CHECK(mj["resource_name"].get<std::string>() == "Example MCP");
+        CHECK(mj["resource_documentation"].get<std::string>() == "https://example.com/docs");
+        CHECK(mj["bearer_methods_supported"].get_array().size() == 1);
+
+        // evaluate_bearer_auth fail-closed branches
+        OAuthResourceConfig cfg;
+        cfg.enabled = true;
+        cfg.expectedIssuers = {"https://auth.example.com"};
+        cfg.defaultScopes = {"mcp:read"};
+
+        HttpRouteRequest req;
+        // 1. Missing validator -> ServiceUnavailable
+        CHECK(mcp_detail::evaluate_bearer_auth(cfg, "https://example.com/mcp", req).status ==
+              TokenValidationResult::Status::ServiceUnavailable);
+
+        cfg.validateToken = [](const TokenValidationContext &c) -> TokenValidationResult {
+            if (c.token == "throw-std")
+                throw std::runtime_error("val Bearer s3cr3t");
+            if (c.token == "throw-unk")
+                throw 99;
+            if (c.token == "invalid-empty")
+                return TokenValidationResult{.status = TokenValidationResult::Status::InvalidToken};
+            if (c.token == "insuff-empty")
+                return TokenValidationResult{.status = TokenValidationResult::Status::InsufficientScope};
+            if (c.token == "unauth") {
+                TokenValidationResult r;
+                r.status = TokenValidationResult::Status::Valid;
+                r.principal.authenticated = false;
+                return r;
+            }
+            if (c.token == "expired") {
+                TokenValidationResult r;
+                r.status = TokenValidationResult::Status::Valid;
+                r.principal.authenticated = true;
+                r.principal.expiresAt = std::chrono::system_clock::now() - std::chrono::seconds(10);
+                return r;
+            }
+            if (c.token == "bad-iss") {
+                TokenValidationResult r;
+                r.status = TokenValidationResult::Status::Valid;
+                r.principal.authenticated = true;
+                r.principal.issuer = "https://evil.example.com";
+                return r;
+            }
+            if (c.token == "bad-aud") {
+                TokenValidationResult r;
+                r.status = TokenValidationResult::Status::Valid;
+                r.principal.authenticated = true;
+                r.principal.issuer = "https://auth.example.com";
+                r.principal.audience = "https://other.example.com";
+                return r;
+            }
+            TokenValidationResult r;
+            r.status = TokenValidationResult::Status::Valid;
+            r.principal.authenticated = true;
+            r.principal.issuer = "https://auth.example.com";
+            r.principal.audience = std::string(c.expectedResource);
+            r.principal.scopes = {}; // missing default scope mcp:read
+            return r;
+        };
+
+        // 2. Query-string access_token rejected
+        HttpRouteRequest qReq;
+        qReq.queryParams["access_token"] = "tok";
+        CHECK(mcp_detail::evaluate_bearer_auth(cfg, "https://example.com/mcp", qReq).status ==
+              TokenValidationResult::Status::InvalidToken);
+
+        // 3. Missing Authorization header / non-Bearer
+        CHECK(mcp_detail::evaluate_bearer_auth(cfg, "https://example.com/mcp", req).status ==
+              TokenValidationResult::Status::InvalidToken);
+        req.headers["authorization"] = "Basic dXNlcjpwYXNz";
+        CHECK(mcp_detail::evaluate_bearer_auth(cfg, "https://example.com/mcp", req).status ==
+              TokenValidationResult::Status::InvalidToken);
+
+        auto evalTok = [&](std::string tok) {
+            HttpRouteRequest r;
+            r.headers["authorization"] = "Bearer " + std::move(tok);
+            return mcp_detail::evaluate_bearer_auth(cfg, "https://example.com/mcp", r);
+        };
+
+        CHECK(evalTok("throw-std").status == TokenValidationResult::Status::ServiceUnavailable);
+        CHECK(evalTok("throw-std").errorDescription.find("s3cr3t") == std::string::npos);
+        CHECK(evalTok("throw-unk").status == TokenValidationResult::Status::ServiceUnavailable);
+        CHECK(evalTok("invalid-empty").errorDescription == "Invalid or expired token");
+        CHECK(evalTok("insuff-empty").errorDescription == "Insufficient scope");
+        CHECK(evalTok("unauth").status == TokenValidationResult::Status::InvalidToken);
+        CHECK(evalTok("expired").status == TokenValidationResult::Status::InvalidToken);
+        CHECK(evalTok("bad-iss").status == TokenValidationResult::Status::InvalidToken);
+        CHECK(evalTok("bad-aud").status == TokenValidationResult::Status::InvalidToken);
+        auto insuff = evalTok("missing-scope");
+        CHECK(insuff.status == TokenValidationResult::Status::InsufficientScope);
+        CHECK(insuff.requiredScopes == std::vector<std::string>{"mcp:read"});
     }
 }
 
