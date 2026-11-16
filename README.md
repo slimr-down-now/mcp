@@ -1,24 +1,23 @@
 # slimr::mcp
 
-MCP-first C++26 framework (`2026-07-28` specification) turning reflected C++ structs into a stdio MCP server, a standalone Streamable HTTP + OAuth Resource Server daemon (`slimr::mcp_http`), and a narrow JSON CLI.
+HTTP-only MCP-first C++26 framework (`2026-07-28` specification) built as an adapter on `slimr::serve`, turning reflected C++ structs into a Streamable HTTP + OAuth Resource Server daemon (`slimr::mcp_http`) and a narrow JSON CLI.
 
-> **Breaking change (`2026-07-28`):** `slimr::Gateway` and pre-July session/init APIs (`initialize`, `ping`, HTTP session IDs, GET SSE streams) have been removed. Each plugin runs as its own native binary (`<bin> mcp` or `<bin> http`) with typed [`RequestContext`](ports/slimr-mcp/mcp.hpp) metadata, `server/discover`, `resultType` / MRTR (`-32021`), `CacheableResult`, and cooperative cancellation.
+> **Breaking change (`2026-07-28`):** `slimr::Gateway`, pre-July session/init APIs (`initialize`, `ping`, HTTP session IDs, GET SSE streams), and the stdio NDJSON transport (`<bin> mcp`) have been removed. Each plugin runs as an HTTP/Unix-socket service (`<bin> http` or `<bin> serve`) with typed [`RequestContext`](ports/slimr-mcp/mcp.hpp) metadata, `server/discover` (including `apiVersion` when `> 0`), `structuredContent` / `outputSchema` for typed outputs, `resultType` / MRTR (`-32021`), `CacheableResult`, and cooperative cancellation.
 
 ## Why `slimr::mcp`?
 
-Traditional CLI frameworks pull in thousands of lines of flag parsing that AI agents never use and that duplicate MCP's JSON input schema. `slimr::mcp` keeps a single source of truth per tool:
+Traditional CLI frameworks pull in thousands of lines of flag parsing that AI agents never use and that duplicate MCP's JSON input schema. `slimr::mcp` delegates tool registration, CLI dispatch, plain HTTP (`GET /health`, `GET /schema`, `POST /:tool`), auth, and daemon listeners to `slimr::serve` while providing the MCP `2026-07-28` protocol layer:
 
-1. **One struct, three surfaces:** Every tool takes a single reflected C++ struct (`slimr::Field<T, "description">` / `slimr::OptField<T, "description">`).
-   - **`<bin> mcp`** runs the multi-worker stdio NDJSON MCP `2026-07-28` server (`server/discover`, `_meta` validation, `notifications/cancelled`, `instructions`, `resources`, and auto-registered `mcp_resource_read` when resources are present).
-   - **`<bin> http [--host <addr>] [--port <n>]`** (when linked with `slimr::mcp_http` + `slimr::enable_http(app, opts)`) serves Streamable HTTP on `POST /mcp` with request-scoped chunked SSE streaming, HTTP header reflection (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` including `x-mcp-header` + RFC 2047 `=?base64?...?=`), bounded concurrency, and RFC 9728 / OAuth 2.1 Resource Server bearer validation.
-   - **`<bin> <tool> ['{"arg":"val"}' | @path | -]`** (opt-in via `app.allowCliTools = true`, disabled by default) invokes `<tool>` directly from the terminal or a `launchd` job using the exact same JSON-to-struct deserializer (defaulting to `"{}"` when omitted). Accepts plain tool arguments or an `{"input":{...},"context":{"session":...}}` envelope (`session` is a string or object populating `RequestContext::session`; identity stays unauthenticated local owner).
+1. **One struct, multiple surfaces:** Every tool takes a single reflected C++ struct (`slimr::Field<T, "description">` / `slimr::OptField<T, "description">`) and optionally returns a reflected output struct (`OutputStruct` -> `outputSchema` in `tools/list` and `structuredContent` in `tools/call`).
+   - **`<bin> http|serve [--host <addr>] [--port <n>] [--socket <path>] [--socket-mode <octal>] [--socket-group <name>]`** (when linked with `slimr::mcp_http` + `slimr::enable_http(app, opts)`) serves Streamable HTTP on `POST /mcp` alongside `slimr::ServeHttpServer` routes (`POST /:tool`, `GET /health`, `GET /schema`), HTTP header reflection (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*` including `x-mcp-header` + RFC 2047 `=?base64?...?=`), and RFC 9728 / OAuth 2.1 Resource Server bearer validation on TCP (Unix socket requests run as the local principal without OAuth).
+   - **`<bin> <tool> ['{"arg":"val"}' | @path | -]`** (opt-in via `app.allowCliTools = true`, disabled by default) invokes `<tool>` directly from the terminal or a `launchd` job using `slimr::run_cli` (defaulting to `"{}"` when omitted). Accepts plain tool arguments or an `{"input":{...},"context":{"session":"..."}}` envelope.
 2. **Thread safety & cooperative cancellation:** Tools serialize by default (`ConcurrencyPolicy::Serialized`) or opt into concurrent execution via `ToolOptions{.threadSafe = true}`. Handlers taking `(const Input&, const slimr::RequestContext&)` receive `ctx.principal`, `ctx.cancellation`, `ctx.emitProgress(...)`, `ctx.emitLog(...)`, and MRTR continuation fields (`inputResponses`, `requestState`).
 3. **Native MCP Media & Security:** Return `McpResult::image(base64, mime)` or `McpResult::audio(base64, mime)` directly from tool handlers. Sensitive bearer tokens and secrets are redacted from internal error/log strings (`redact_sensitive`).
 4. **Built-in Bugsink Reporting:** Unhandled exceptions in tool handlers are reported cleanly when `app.setBugsink(dsn)` is configured.
 
 ## Install
 
-Add `slimr-down-now/mcp` to `vcpkg-configuration.json`:
+Add `slimr-down-now/mcp` (and `slimr-down-now/serve` once released) to `vcpkg-configuration.json`:
 
 ```json
 {
@@ -31,14 +30,14 @@ Add `slimr-down-now/mcp` to `vcpkg-configuration.json`:
 }
 ```
 
-Declare `slimr-mcp` in `vcpkg.json` and link `slimr::mcp` (or `slimr::mcp_http` with feature `"http"`) in `CMakeLists.txt`:
+Declare `slimr-mcp` (with feature `"http"` for `slimr::mcp_http`) in `vcpkg.json` and link `slimr::mcp_http` in `CMakeLists.txt`:
 
 ```cmake
 find_package(slimr-mcp CONFIG REQUIRED)
-target_link_libraries(my_target PRIVATE slimr::mcp)
+target_link_libraries(my_target PRIVATE slimr::mcp_http)
 ```
 
-When using the `"http"` feature, `slimr-mcp` pulls `cpp-httplib[openssl]` from the default vcpkg registry.
+When using the `"http"` feature, `slimr-mcp` pulls `slimr-serve[http]` and `cpp-httplib[openssl]`.
 
 ## Quick Start
 
@@ -87,7 +86,7 @@ inline slimr::PluginApp make_greet_app() {
 
 ### 2. Standalone Entrypoint with Streamable HTTP & OAuth (`src/main.cpp`)
 
-Use `slimr::mcp` alone for stdio+CLI, or link `slimr::mcp_http` (via the `"http"` vcpkg feature) to attach `http` subcommand support:
+Link `slimr::mcp_http` (via the `"http"` vcpkg feature) to attach `http` / `serve` subcommand support:
 
 ```cpp
 #include "app.hpp"
@@ -146,7 +145,7 @@ detached or forcibly terminated.
 | Request MRTR follow-up input | `slimr::McpResult::inputRequired("Need choice", jsonSchema, state)` |
 | Return tool or protocol error | `slimr::McpResult::error("Not found")` / `throw slimr::McpProtocolException(slimr::McpErrorCode::InputRequired, ...)` |
 | Attach Streamable HTTP CLI subcommand | `slimr::enable_http(app, httpOpts)` (links `slimr::mcp_http`) |
-| Run CLI, `mcp`, or `http` | `app.run(argc, argv)` |
+| Run CLI, `http`, or `serve` | `app.run(argc, argv)` |
 
 ## Environment Variables
 

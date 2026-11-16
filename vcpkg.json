@@ -14,11 +14,15 @@
     {
       "name": "slimr-reflect",
       "version>=": "0.1.1"
+    },
+    {
+      "name": "slimr-serve",
+      "version>=": "0.1.1"
     }
   ],
   "features": {
     "http": {
-      "description": "Streamable HTTP and OAuth resource-server support via cpp-httplib",
+      "description": "Streamable HTTP and OAuth resource-server support via slimr-serve and cpp-httplib",
       "dependencies": [
         {
           "name": "cpp-httplib",
@@ -26,6 +30,13 @@
           "features": [
             "openssl"
           ]
+        },
+        {
+          "name": "slimr-serve",
+          "features": [
+            "http"
+          ],
+          "version>=": "0.1.1"
         }
       ]
     },
@@ -38,6 +49,13 @@
           "features": [
             "openssl"
           ]
+        },
+        {
+          "name": "slimr-serve",
+          "features": [
+            "http"
+          ],
+          "version>=": "0.1.1"
         },
         {
           "name": "slimr-test",

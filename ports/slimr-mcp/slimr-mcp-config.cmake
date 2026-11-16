@@ -2,19 +2,20 @@ include(CMakeFindDependencyMacro)
 find_dependency(slimr-json CONFIG)
 find_dependency(slimr-reflect CONFIG)
 find_dependency(slimr-bugsink CONFIG)
+find_dependency(slimr-serve CONFIG)
 if(NOT TARGET slimr::mcp)
     add_library(slimr::mcp INTERFACE IMPORTED)
     set_target_properties(slimr::mcp PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include"
         INTERFACE_COMPILE_FEATURES cxx_std_26
-        INTERFACE_LINK_LIBRARIES "slimr::json;slimr::reflect;slimr::bugsink")
+        INTERFACE_LINK_LIBRARIES "slimr::serve;slimr::json;slimr::reflect;slimr::bugsink")
 endif()
 
 find_package(httplib CONFIG QUIET)
-if(TARGET httplib::httplib AND NOT TARGET slimr::mcp_http)
+if(TARGET slimr::serve_http AND TARGET httplib::httplib AND NOT TARGET slimr::mcp_http)
     add_library(slimr::mcp_http INTERFACE IMPORTED)
     set_target_properties(slimr::mcp_http PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include"
         INTERFACE_COMPILE_FEATURES cxx_std_26
-        INTERFACE_LINK_LIBRARIES "slimr::mcp;httplib::httplib")
+        INTERFACE_LINK_LIBRARIES "slimr::mcp;slimr::serve_http;httplib::httplib")
 endif()

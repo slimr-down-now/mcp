@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Refactor `slimr-mcp` as an HTTP-only MCP `2026-07-28` adapter on `slimr-serve` (`structuredContent`/`outputSchema` for typed outputs, `apiVersion` in `server/discover`, Unix socket OAuth bypass) and remove stdio transport (`<bin> mcp`).
 - Docs: fix HTTP socket write timeout in README (500 ms).
 
 ## v0.1.4 - 2026-11-16

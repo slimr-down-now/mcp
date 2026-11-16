@@ -3,6 +3,9 @@
     "kind": "builtin",
     "baseline": "4df3365fcbb4795a44795883f8719bbb3b3bcd77"
   },
+  "overlay-ports": [
+    "../serve/ports/slimr-serve"
+  ],
   "registries": [
     {
       "kind": "git",

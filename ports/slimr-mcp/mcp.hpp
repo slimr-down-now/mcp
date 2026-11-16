@@ -1,30 +1,20 @@
 #pragma once
-#include "bugsink.hpp"
-#include "json.hpp"
-#include "reflect.hpp"
+#include <serve.hpp>
 
 #include <algorithm>
-#include <atomic>
+#include <any>
 #include <cctype>
-#include <chrono>
-#include <condition_variable>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -41,111 +31,11 @@ inline constexpr int InternalError = -32603;
 inline constexpr int HeaderMismatch = -32020;
 inline constexpr int MissingRequiredClientCapability = -32021;
 inline constexpr int UnsupportedProtocolVersion = -32022;
-inline constexpr int RequestCancelled = -32000;
-inline constexpr int InsufficientScope = -32001;
+inline constexpr int RequestCancelled = ServeErrorCode::RequestCancelled;
+inline constexpr int InsufficientScope = ServeErrorCode::InsufficientScope;
 } // namespace McpErrorCode
 
 namespace mcp_detail {
-
-inline std::string ascii_lower(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size());
-    for (unsigned char c : sv) {
-        out.push_back(static_cast<char>(std::tolower(c)));
-    }
-    return out;
-}
-
-inline bool is_sensitive_key(std::string_view key) {
-    std::string lower = ascii_lower(key);
-    return lower == "authorization" || lower == "proxy-authorization" ||
-           lower == "cookie" || lower == "set-cookie" ||
-           lower == "access_token" || lower == "refresh_token" ||
-           lower == "id_token" || lower == "client_secret" ||
-           lower == "token" || lower == "secret" ||
-           lower == "password" || lower == "api_key" ||
-           lower == "apikey" || lower == "code" ||
-           lower == "code_verifier" || lower == "x-api-key";
-}
-
-inline void redact_param_in_place(std::string &text, std::string_view param) {
-    if (text.empty() || param.empty())
-        return;
-    std::string lower = ascii_lower(text);
-    std::string needle = ascii_lower(param) + "=";
-    size_t pos = 0;
-    while ((pos = lower.find(needle, pos)) != std::string::npos) {
-        if (pos > 0) {
-            char prev = lower[pos - 1];
-            if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_') {
-                pos += needle.size();
-                continue;
-            }
-        }
-        size_t valStart = pos + needle.size();
-        size_t valEnd = valStart;
-        while (valEnd < text.size() && text[valEnd] != '&' &&
-               text[valEnd] != ' ' && text[valEnd] != '"' &&
-               text[valEnd] != '\'' && text[valEnd] != '\n' &&
-               text[valEnd] != '\r') {
-            ++valEnd;
-        }
-        text.replace(valStart, valEnd - valStart, "[REDACTED]");
-        lower = ascii_lower(text);
-        pos = valStart + 10;
-    }
-}
-
-inline void redact_scheme_in_place(std::string &text, std::string_view scheme) {
-    if (text.empty())
-        return;
-    std::string lower = ascii_lower(text);
-    std::string needle = ascii_lower(scheme) + " ";
-    size_t pos = 0;
-    while ((pos = lower.find(needle, pos)) != std::string::npos) {
-        if (pos > 0 && std::isalnum(static_cast<unsigned char>(lower[pos - 1]))) {
-            pos += needle.size();
-            continue;
-        }
-        size_t valStart = pos + needle.size();
-        while (valStart < text.size() && text[valStart] == ' ')
-            ++valStart;
-        size_t valEnd = valStart;
-        while (valEnd < text.size() && text[valEnd] != ' ' &&
-               text[valEnd] != '"' && text[valEnd] != '\'' &&
-               text[valEnd] != '\n' && text[valEnd] != '\r' &&
-               text[valEnd] != ',' && text[valEnd] != ';') {
-            ++valEnd;
-        }
-        if (valEnd > valStart) {
-            text.replace(valStart, valEnd - valStart, "[REDACTED]");
-            lower = ascii_lower(text);
-            pos = valStart + 10;
-        } else {
-            pos = valStart;
-        }
-    }
-}
-
-inline int log_level_severity(std::string_view level) noexcept {
-    if (level == "debug")
-        return 0;
-    if (level == "info")
-        return 1;
-    if (level == "notice")
-        return 2;
-    if (level == "warning")
-        return 3;
-    if (level == "error")
-        return 4;
-    if (level == "critical")
-        return 5;
-    if (level == "alert")
-        return 6;
-    if (level == "emergency")
-        return 7;
-    return -1;
-}
 
 inline std::string id_key(const Json &id) {
     if (id.is_string()) {
@@ -166,176 +56,7 @@ inline bool is_valid_progress_token(const Json &tok) noexcept {
     return is_valid_rpc_id(tok);
 }
 
-inline void strip_trailing_ws(std::string &line) {
-    while (!line.empty() &&
-           (line.back() == '\r' || line.back() == '\n' ||
-            line.back() == ' ' || line.back() == '\t')) {
-        line.pop_back();
-    }
-}
-
 } // namespace mcp_detail
-
-/** Redacts bearer tokens, authorization headers, and secret URL query parameters from text. */
-inline std::string redact_sensitive(std::string_view input) {
-    std::string out(input);
-    mcp_detail::redact_scheme_in_place(out, "Bearer");
-    mcp_detail::redact_scheme_in_place(out, "Basic");
-    static constexpr std::string_view kSensitiveParams[] = {
-        "access_token", "refresh_token", "id_token", "client_secret",
-        "code_verifier", "code", "token", "secret", "password",
-        "api_key", "apikey", "key"};
-    for (std::string_view p : kSensitiveParams) {
-        mcp_detail::redact_param_in_place(out, p);
-    }
-    return out;
-}
-
-/** Recursively redacts sensitive keys and secret-bearing string values inside a JSON value. */
-inline Json redact_json(const Json &val) {
-    if (val.is_object()) {
-        Json out = json_obj();
-        for (const auto &[k, v] : val.get_object()) {
-            if (mcp_detail::is_sensitive_key(k)) {
-                out[k] = "[REDACTED]";
-            } else {
-                out[k] = redact_json(v);
-            }
-        }
-        return out;
-    }
-    if (val.is_array()) {
-        Json::array_t arr;
-        arr.reserve(val.get_array().size());
-        for (const auto &el : val.get_array()) {
-            arr.push_back(redact_json(el));
-        }
-        return json_arr(std::move(arr));
-    }
-    if (val.is_string()) {
-        return Json(redact_sensitive(val.get<std::string>()));
-    }
-    return val;
-}
-
-/** Authenticated caller identity and authorization grants for a single MCP request. */
-struct Principal {
-    bool authenticated{false};
-    std::string subject;
-    std::string clientId;
-    std::string issuer;
-    std::string audience;
-    std::vector<std::string> scopes;
-    std::optional<std::chrono::system_clock::time_point> expiresAt;
-    Json claims = json_obj();
-
-    bool hasScope(std::string_view scope) const noexcept {
-        for (const auto &s : scopes) {
-            if (s == scope)
-                return true;
-        }
-        return false;
-    }
-
-    bool hasAllScopes(std::span<const std::string_view> required) const noexcept {
-        for (std::string_view r : required) {
-            if (!hasScope(r))
-                return false;
-        }
-        return true;
-    }
-
-    bool hasAllScopes(std::span<const std::string> required) const noexcept {
-        for (const auto &r : required) {
-            if (!hasScope(r))
-                return false;
-        }
-        return true;
-    }
-};
-
-/** Thread-safe cooperative cancellation token observed by request handlers and sinks. */
-class CancellationToken {
-  public:
-    struct State {
-        std::atomic<bool> cancelled{false};
-        std::mutex mu;
-        uint64_t nextId{1};
-        std::vector<std::pair<uint64_t, std::function<void()>>> callbacks;
-    };
-
-    CancellationToken() = default;
-    explicit CancellationToken(std::shared_ptr<State> state) noexcept
-        : state_(std::move(state)) {}
-
-    bool canBeCancelled() const noexcept { return state_ != nullptr; }
-
-    bool isCancelled() const noexcept {
-        return state_ && state_->cancelled.load(std::memory_order_acquire);
-    }
-
-    uint64_t onCancel(std::function<void()> cb) const {
-        if (!state_ || !cb)
-            return 0;
-        std::unique_lock lock(state_->mu);
-        if (state_->cancelled.load(std::memory_order_acquire)) {
-            lock.unlock();
-            try {
-                cb();
-            } catch (...) {
-            }
-            return 0;
-        }
-        uint64_t id = state_->nextId++;
-        state_->callbacks.emplace_back(id, std::move(cb));
-        return id;
-    }
-
-    void removeOnCancel(uint64_t id) const {
-        if (!state_ || id == 0)
-            return;
-        std::lock_guard lock(state_->mu);
-        std::erase_if(state_->callbacks, [id](const auto &entry) { return entry.first == id; });
-    }
-
-  private:
-    std::shared_ptr<State> state_;
-};
-
-/** Owns the trigger side of a CancellationToken. */
-class CancellationSource {
-  public:
-    CancellationSource() : state_(std::make_shared<CancellationToken::State>()) {}
-
-    CancellationToken token() const noexcept { return CancellationToken(state_); }
-
-    bool isCancelled() const noexcept {
-        return state_->cancelled.load(std::memory_order_acquire);
-    }
-
-    void cancel() const noexcept {
-        bool expected = false;
-        if (!state_->cancelled.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return;
-        }
-        std::vector<std::pair<uint64_t, std::function<void()>>> cbs;
-        {
-            std::lock_guard lock(state_->mu);
-            cbs.swap(state_->callbacks);
-        }
-        for (auto &[id, fn] : cbs) {
-            (void)id;
-            try {
-                if (fn)
-                    fn();
-            } catch (...) {
-            }
-        }
-    }
-
-  private:
-    std::shared_ptr<CancellationToken::State> state_;
-};
 
 /** Protocol-level JSON-RPC exception propagated directly as a JSON-RPC error response. */
 class McpProtocolException : public std::runtime_error {
@@ -347,115 +68,26 @@ class McpProtocolException : public std::runtime_error {
         : std::runtime_error(std::move(message)), code(errCode), data(std::move(errData)) {}
 };
 
-/** Thread-safe request-scoped notification channel bound by the active transport. */
-class McpNotificationChannel {
-  public:
-    using SinkFn = std::function<void(const Json &)>;
+using McpNotificationChannel = NotificationChannel;
 
-    explicit McpNotificationChannel(SinkFn sink = nullptr) : sink_(std::move(sink)) {}
+inline bool has_client_capability(const RequestContext &ctx, std::string_view cap) noexcept {
+    return ctx.clientCapabilities.is_object() && ctx.clientCapabilities.contains(cap);
+}
 
-    void emit(const Json &notification) {
-        SinkFn fn;
-        {
-            std::lock_guard lock(mu_);
-            if (closed_ || !sink_)
-                return;
-            fn = sink_;
-        }
-        fn(notification);
-    }
-
-    void close() noexcept {
-        std::lock_guard lock(mu_);
-        closed_ = true;
-        sink_ = nullptr;
-    }
-
-  private:
-    std::mutex mu_;
-    bool closed_{false};
-    SinkFn sink_;
-};
-
-/** Per-request metadata, caller principal, cancellation token, and notification emitters. */
-struct RequestContext {
-    std::string protocolVersion{std::string(kMcpProtocolVersion)};
-    Json clientCapabilities = json_obj();
-    Json clientInfo = json_obj();
-    Json requestMeta = json_obj();
-    std::optional<Json> requestId;
-    std::optional<Json> progressToken;
-    std::optional<std::string> minLogLevel;
-    std::optional<Json> inputResponses;
-    std::optional<std::string> requestState;
-    std::optional<Json> session;
-    Principal principal;
-    CancellationToken cancellation;
-    std::shared_ptr<McpNotificationChannel> notificationChannel;
-
-    bool hasClientCapability(std::string_view cap) const noexcept {
-        return clientCapabilities.is_object() && clientCapabilities.contains(cap);
-    }
-
-    void requireClientCapability(std::string_view cap, const Json &requirement = json_obj()) const {
-        if (hasClientCapability(cap))
-            return;
-        Json reqCaps = json_obj();
-        reqCaps[std::string(cap)] = requirement;
-        Json data = json_obj();
-        data["requiredCapabilities"] = std::move(reqCaps);
-        throw McpProtocolException(
-            McpErrorCode::MissingRequiredClientCapability,
-            "Client lacks required capability: " + std::string(cap),
-            std::move(data));
-    }
-
-    void emitProgress(double progress,
-                      std::optional<double> total = std::nullopt,
-                      std::optional<std::string> message = std::nullopt) const {
-        if (!progressToken.has_value() || !notificationChannel || cancellation.isCancelled()) {
-            return;
-        }
-        Json params = json_obj();
-        params["progressToken"] = *progressToken;
-        params["progress"] = progress;
-        if (total.has_value()) {
-            params["total"] = *total;
-        }
-        if (message.has_value()) {
-            params["message"] = *message;
-        }
-        Json notif = json_obj();
-        notif["jsonrpc"] = "2.0";
-        notif["method"] = "notifications/progress";
-        notif["params"] = std::move(params);
-        notificationChannel->emit(notif);
-    }
-
-    void emitLog(std::string_view level,
-                 const Json &data,
-                 std::optional<std::string> logger = std::nullopt) const {
-        if (!minLogLevel.has_value() || !notificationChannel || cancellation.isCancelled()) {
-            return;
-        }
-        int msgSev = mcp_detail::log_level_severity(level);
-        int minSev = mcp_detail::log_level_severity(*minLogLevel);
-        if (msgSev < 0 || minSev < 0 || msgSev < minSev) {
-            return;
-        }
-        Json params = json_obj();
-        params["level"] = std::string(level);
-        if (logger.has_value()) {
-            params["logger"] = *logger;
-        }
-        params["data"] = redact_json(data);
-        Json notif = json_obj();
-        notif["jsonrpc"] = "2.0";
-        notif["method"] = "notifications/message";
-        notif["params"] = std::move(params);
-        notificationChannel->emit(notif);
-    }
-};
+inline void require_client_capability(const RequestContext &ctx,
+                                      std::string_view cap,
+                                      const Json &requirement = json_obj()) {
+    if (has_client_capability(ctx, cap))
+        return;
+    Json reqCaps = json_obj();
+    reqCaps[std::string(cap)] = requirement;
+    Json data = json_obj();
+    data["requiredCapabilities"] = std::move(reqCaps);
+    throw McpProtocolException(
+        McpErrorCode::MissingRequiredClientCapability,
+        "Client lacks required capability: " + std::string(cap),
+        std::move(data));
+}
 
 struct ContentBlock {
     std::string type;     // "text", "image", "audio", "resource"
@@ -563,47 +195,6 @@ struct Resource {
     std::vector<std::string> requiredScopes;
 };
 
-struct ToolAnnotations {
-    std::optional<bool> readOnlyHint;
-    std::optional<bool> destructiveHint;
-    std::optional<bool> idempotentHint;
-    std::optional<bool> openWorldHint;
-
-    Json toJson() const {
-        Json j = json_obj();
-        if (readOnlyHint.has_value())
-            j["readOnlyHint"] = *readOnlyHint;
-        if (destructiveHint.has_value())
-            j["destructiveHint"] = *destructiveHint;
-        if (idempotentHint.has_value())
-            j["idempotentHint"] = *idempotentHint;
-        if (openWorldHint.has_value())
-            j["openWorldHint"] = *openWorldHint;
-        return j;
-    }
-};
-
-struct ToolOptions {
-    ToolAnnotations annotations;
-    bool threadSafe{false};
-    std::vector<std::string> requiredScopes;
-};
-
-struct ToolDef {
-    std::string name;
-    std::string description;
-    ToolAnnotations annotations;
-    bool threadSafe{false};
-    std::vector<std::string> requiredScopes;
-    Json inputSchema;
-    std::function<McpResult(const Json &, const RequestContext &)> handler;
-};
-
-enum class ConcurrencyPolicy {
-    Serialized,
-    Parallel
-};
-
 struct CachePolicy {
     int64_t discoverTtlMs{3600000};
     std::string discoverCacheScope{"public"};
@@ -613,133 +204,119 @@ struct CachePolicy {
     std::string resourcesListCacheScope{"public"};
 };
 
-struct RequiredEnvVar {
-    std::string name;
-    std::string purpose;
-};
+inline ServeResult mcp_result_to_serve_result(McpResult mr) {
+    if (mr.isError) {
+        std::string msg;
+        for (const auto &b : mr.content) {
+            if (b.type == "text" && !b.text.empty()) {
+                msg = b.text;
+                break;
+            }
+        }
+        if (msg.empty()) {
+            msg = "Tool error";
+        }
+        return ServeResult::withExtension(std::move(mr), ServeResult::error(std::move(msg), 400));
+    }
+    if (mr.isInputRequired) {
+        Json j = mr.toJson();
+        return ServeResult::withExtension(std::move(mr), ServeResult::json(std::move(j)));
+    }
+    if (mr.structuredContent.has_value()) {
+        Json sc = *mr.structuredContent;
+        return ServeResult::withExtension(std::move(mr), ServeResult::json(std::move(sc)));
+    }
+    if (mr.content.size() == 1 && mr.content[0].type == "text") {
+        std::string txt = mr.content[0].text;
+        return ServeResult::withExtension(std::move(mr), ServeResult::text(std::move(txt)));
+    }
+    Json::array_t arr;
+    arr.reserve(mr.content.size());
+    for (const auto &b : mr.content) {
+        arr.push_back(content_to_json(b));
+    }
+    return ServeResult::withExtension(std::move(mr), ServeResult::json(json_arr(std::move(arr))));
+}
 
-class PluginApp {
+inline McpResult serve_result_to_mcp_result(const ServeResult &sr) {
+    if (sr.extension.has_value()) {
+        if (const auto *mr = std::any_cast<McpResult>(&sr.extension)) {
+            return *mr;
+        }
+    }
+    if (sr.isError) {
+        return McpResult::error(sr.errorMessage);
+    }
+    if (sr.isTyped) {
+        return McpResult::structured(sr.data);
+    }
+    if (sr.isJson) {
+        return McpResult::text(slimr::write_json(sr.data));
+    }
+    return McpResult::text(sr.textValue);
+}
+
+/** MCP 2026-07-28 protocol adapter over slimr::ServeApp. */
+class PluginApp : public ServeApp {
   public:
-    using AuthorizerFn = std::function<bool(const Principal &, std::string_view operation, std::string &outError)>;
-    using HttpRunnerFn = std::function<int(PluginApp &, int argc, char **argv)>;
-
-    std::string key;
-    std::string version = "1.0.0";
-    std::string description;
-    std::string instructions;
-    std::string bugsinkDsn;
     std::vector<Resource> resources;
-    std::vector<RequiredEnvVar> requiredEnvVars;
-    ConcurrencyPolicy concurrency{ConcurrencyPolicy::Serialized};
-    bool allowCliTools{false};
     CachePolicy cachePolicy;
-    std::vector<std::string> defaultRequiredScopes;
-    AuthorizerFn authorizer;
 
-    PluginApp() : runtime_(std::make_shared<RuntimeState>()) {}
+    PluginApp() : ServeApp() { allowCliTools = false; }
     PluginApp(PluginApp &&) noexcept = default;
     PluginApp &operator=(PluginApp &&) noexcept = default;
     explicit PluginApp(std::string appKey, std::string appVer = "1.0.0")
-        : key(std::move(appKey)), version(std::move(appVer)), runtime_(std::make_shared<RuntimeState>()) {}
-
-    void setBugsink(std::string dsn, std::string envVar = "BUGSINK_DSN", std::string release = "") {
-        bugsinkDsn = dsn;
-        if (release.empty() && !key.empty() && !version.empty()) {
-            release = key + "@" + version;
-        }
-        runtime_->bugsink = std::make_shared<BugsinkReporter>(std::move(dsn), std::move(envVar), std::move(release));
+        : ServeApp(std::move(appKey), std::move(appVer)) {
+        allowCliTools = false;
     }
 
-    BugsinkReporter *bugsink() const noexcept {
-        return runtime_ ? runtime_->bugsink.get() : nullptr;
-    }
+    ServeApp &serve() noexcept { return *this; }
+    const ServeApp &serve() const noexcept { return *this; }
 
-    void setHttpRunner(HttpRunnerFn runner) {
-        httpRunner_ = std::move(runner);
-    }
-
-    bool hasHttpRunner() const noexcept { return static_cast<bool>(httpRunner_); }
-
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method)
     PluginApp &requireEnv(std::string name, std::string purpose) {
-        requiredEnvVars.push_back(RequiredEnvVar{std::move(name), std::move(purpose)});
+        ServeApp::requireEnv(std::move(name), std::move(purpose));
         return *this;
     }
 
     template <typename InputStruct, typename Handler>
     PluginApp &tool(std::string name, std::string desc, ToolOptions opts, Handler &&h) {
-        ToolDef def;
-        def.name = name;
-        def.description = std::move(desc);
-        def.annotations = std::move(opts.annotations);
-        def.threadSafe = opts.threadSafe;
-        def.requiredScopes = std::move(opts.requiredScopes);
-        def.inputSchema = schema<InputStruct>();
+        using InvokeRet = typename std::conditional_t<
+            std::invocable<Handler &, const InputStruct &, const RequestContext &>,
+            std::invoke_result<Handler &, const InputStruct &, const RequestContext &>,
+            std::invoke_result<Handler &, const InputStruct &>>::type;
+        using PlainRet = std::remove_cvref_t<InvokeRet>;
 
-        std::weak_ptr<RuntimeState> weakRt = runtime_;
-        def.handler = [weakRt, toolName = name, h = std::forward<Handler>(h)](
-                          const Json &args_json, const RequestContext &ctx) mutable -> McpResult {
-            InputStruct input{};
-            if constexpr (!std::is_same_v<InputStruct, std::monostate>) {
-                std::string serialized_args = slimr::write_json(args_json);
-                auto ec = glz::read_json(input, serialized_args);
-                if (ec) {
-                    return McpResult::error("Invalid input parameters: " + glz::format_error(ec, serialized_args));
+        if constexpr (std::is_same_v<PlainRet, McpResult>) {
+            auto wrapped = [h = std::forward<Handler>(h)](const InputStruct &in, const RequestContext &ctx) mutable -> ServeResult {
+                try {
+                    McpResult mr = [&]() {
+                        if constexpr (std::invocable<Handler &, const InputStruct &, const RequestContext &>) {
+                            return h(in, ctx);
+                        } else {
+                            return h(in);
+                        }
+                    }();
+                    return mcp_result_to_serve_result(std::move(mr));
+                } catch (const McpProtocolException &pe) {
+                    throw ServeException(pe.code, pe.what(), pe.data, 400);
                 }
-            }
-
-            if (ctx.cancellation.isCancelled()) {
-                throw McpProtocolException(McpErrorCode::RequestCancelled, "Request cancelled");
-            }
-
-            try {
-                auto invoke = [&]() -> decltype(auto) {
+            };
+            ServeApp::tool<InputStruct>(std::move(name), std::move(desc), std::move(opts), std::move(wrapped));
+        } else {
+            auto wrapped = [h = std::forward<Handler>(h)](const InputStruct &in, const RequestContext &ctx) mutable -> InvokeRet {
+                try {
                     if constexpr (std::invocable<Handler &, const InputStruct &, const RequestContext &>) {
-                        return h(input, ctx);
+                        return h(in, ctx);
                     } else {
-                        return h(input);
+                        return h(in);
                     }
-                };
-                using Ret = decltype(invoke());
-                if constexpr (std::is_same_v<Ret, McpResult>) {
-                    return invoke();
-                } else if constexpr (std::is_same_v<Ret, std::string> || std::is_same_v<Ret, std::string_view> || std::is_same_v<Ret, const char *>) {
-                    return McpResult::text(invoke());
-                } else if constexpr (std::is_same_v<Ret, Json>) {
-                    Json res = invoke();
-                    return McpResult::text(slimr::write_json(res));
-                } else if constexpr (std::is_void_v<Ret>) {
-                    invoke();
-                    return McpResult::text("{}");
-                } else {
-                    auto res = invoke();
-                    return McpResult::text(slimr::write_json(res));
+                } catch (const McpProtocolException &pe) {
+                    throw ServeException(pe.code, pe.what(), pe.data, 400);
                 }
-            } catch (const McpProtocolException &) {
-                throw;
-            } catch (const std::exception &e) {
-                std::string safeMsg = redact_sensitive(e.what());
-                if (auto rt = weakRt.lock()) {
-                    if (rt->bugsink) {
-                        Json extra = json_obj();
-                        extra["tool"] = toolName;
-                        rt->bugsink->reportError(std::runtime_error(safeMsg), extra);
-                    }
-                }
-                return McpResult::error(safeMsg);
-            } catch (...) {
-                std::runtime_error unk("Unknown exception during tool execution");
-                if (auto rt = weakRt.lock()) {
-                    if (rt->bugsink) {
-                        Json extra = json_obj();
-                        extra["tool"] = toolName;
-                        rt->bugsink->reportError(unk, extra);
-                    }
-                }
-                return McpResult::error(unk.what());
-            }
-        };
-
-        tools_[name] = std::move(def);
+            };
+            ServeApp::tool<InputStruct>(std::move(name), std::move(desc), std::move(opts), std::move(wrapped));
+        }
         return *this;
     }
 
@@ -753,10 +330,9 @@ class PluginApp {
         return tool<InputStruct>(std::move(name), std::move(desc), ToolOptions{}, std::forward<Handler>(h));
     }
 
-    const std::map<std::string, ToolDef> &tools() const noexcept { return tools_; }
-
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method)
     PluginApp &registerTool(ToolDef def) {
-        tools_[def.name] = std::move(def);
+        ServeApp::registerTool(std::move(def));
         return *this;
     }
 
@@ -798,25 +374,6 @@ class PluginApp {
         }
         resp["error"] = std::move(err);
         return resp;
-    }
-
-    /** Finds a registered tool by exact name or underscore/hyphen normalization. */
-    const ToolDef *findTool(std::string_view toolName) const {
-        std::string exact(toolName);
-        if (auto it = tools_.find(exact); it != tools_.end()) {
-            return &it->second;
-        }
-        std::string alt = exact;
-        std::replace(alt.begin(), alt.end(), '_', '-');
-        if (auto it = tools_.find(alt); it != tools_.end()) {
-            return &it->second;
-        }
-        alt = exact;
-        std::replace(alt.begin(), alt.end(), '-', '_');
-        if (auto it = tools_.find(alt); it != tools_.end()) {
-            return &it->second;
-        }
-        return nullptr;
     }
 
     const Resource *findResource(std::string_view uri) const noexcept {
@@ -907,10 +464,59 @@ class PluginApp {
         }
         if (meta.contains("io.modelcontextprotocol/logLevel")) {
             if (!meta["io.modelcontextprotocol/logLevel"].is_string() ||
-                mcp_detail::log_level_severity(meta["io.modelcontextprotocol/logLevel"].get<std::string>()) < 0) {
+                serve_detail::log_level_severity(meta["io.modelcontextprotocol/logLevel"].get<std::string>()) < 0) {
                 return *makeErrorResponse(id, McpErrorCode::InvalidParams, "Invalid params: invalid _meta['io.modelcontextprotocol/logLevel']");
             }
             ctx.minLogLevel = meta["io.modelcontextprotocol/logLevel"].get<std::string>();
+        }
+        if (ctx.notificationChannel) {
+            auto rawChannel = ctx.notificationChannel;
+            auto progressToken = ctx.progressToken;
+            auto minLogLevel = ctx.minLogLevel;
+            ctx.notificationChannel = std::make_shared<NotificationChannel>(
+                [rawChannel, progressToken, minLogLevel](const Json &ev) {
+                    if (!ev.is_object() || !ev.contains("type") || !ev["type"].is_string()) {
+                        rawChannel->emit(ev);
+                        return;
+                    }
+                    const std::string type = ev["type"].get<std::string>();
+                    if (type == "progress") {
+                        if (!progressToken.has_value())
+                            return;
+                        Json params = json_obj();
+                        params["progressToken"] = *progressToken;
+                        if (ev.contains("progress"))
+                            params["progress"] = ev["progress"];
+                        if (ev.contains("total"))
+                            params["total"] = ev["total"];
+                        if (ev.contains("message"))
+                            params["message"] = ev["message"];
+                        Json notif = json_obj();
+                        notif["jsonrpc"] = "2.0";
+                        notif["method"] = "notifications/progress";
+                        notif["params"] = std::move(params);
+                        rawChannel->emit(notif);
+                        return;
+                    }
+                    if (type == "log") {
+                        if (!minLogLevel.has_value())
+                            return;
+                        Json params = json_obj();
+                        if (ev.contains("level"))
+                            params["level"] = ev["level"];
+                        if (ev.contains("logger"))
+                            params["logger"] = ev["logger"];
+                        if (ev.contains("data"))
+                            params["data"] = ev["data"];
+                        Json notif = json_obj();
+                        notif["jsonrpc"] = "2.0";
+                        notif["method"] = "notifications/message";
+                        notif["params"] = std::move(params);
+                        rawChannel->emit(notif);
+                        return;
+                    }
+                    rawChannel->emit(ev);
+                });
         }
         if (params.contains("inputResponses")) {
             if (!params["inputResponses"].is_object()) {
@@ -931,19 +537,22 @@ class PluginApp {
 
         if (method == "tools/list") {
             Json::array_t toolList;
-            for (const auto &[name, def] : tools_) {
+            for (const auto &[name, def] : tools()) {
                 (void)name;
                 Json t = json_obj();
                 t["name"] = def.name;
                 t["description"] = def.description;
                 t["inputSchema"] = def.inputSchema;
+                if (def.outputSchema.has_value()) {
+                    t["outputSchema"] = *def.outputSchema;
+                }
                 auto ann = def.annotations.toJson();
                 if (!ann.empty()) {
                     t["annotations"] = std::move(ann);
                 }
                 toolList.push_back(std::move(t));
             }
-            if (!resources.empty() && !tools_.contains("mcp_resource_read")) {
+            if (!resources.empty() && !tools().contains("mcp_resource_read")) {
                 toolList.push_back(buildMcpResourceReadTool());
             }
             Json result = json_obj();
@@ -981,8 +590,8 @@ class PluginApp {
                     return *authErr;
                 }
                 std::unique_lock<std::mutex> execLock;
-                if (concurrency == ConcurrencyPolicy::Serialized && runtime_) {
-                    execLock = std::unique_lock<std::mutex>(runtime_->execMutex);
+                if (concurrency == ConcurrencyPolicy::Serialized) {
+                    execLock = std::unique_lock<std::mutex>(execMutex());
                 }
                 if (ctx.cancellation.isCancelled()) {
                     return *makeErrorResponse(id, McpErrorCode::RequestCancelled, "Request cancelled");
@@ -994,6 +603,8 @@ class PluginApp {
                     return makeResultResponse(*id, std::move(result));
                 } catch (const McpProtocolException &pe) {
                     return *makeErrorResponse(id, pe.code, pe.what(), pe.data);
+                } catch (const ServeException &se) {
+                    return *makeErrorResponse(id, se.code, se.what(), se.data);
                 } catch (const std::exception &e) {
                     Json result = McpResult::error(redact_sensitive(e.what())).toJson();
                     attachServerMeta(result);
@@ -1010,19 +621,22 @@ class PluginApp {
             }
 
             std::unique_lock<std::mutex> execLock;
-            if (!def->threadSafe && concurrency == ConcurrencyPolicy::Serialized && runtime_) {
-                execLock = std::unique_lock<std::mutex>(runtime_->execMutex);
+            if (!def->threadSafe && concurrency == ConcurrencyPolicy::Serialized) {
+                execLock = std::unique_lock<std::mutex>(execMutex());
             }
             if (ctx.cancellation.isCancelled()) {
                 return *makeErrorResponse(id, McpErrorCode::RequestCancelled, "Request cancelled");
             }
             try {
-                McpResult callRes = def->handler(args, ctx);
-                Json result = callRes.toJson();
+                ServeResult callRes = def->handler(args, ctx);
+                McpResult mcpRes = serve_result_to_mcp_result(callRes);
+                Json result = mcpRes.toJson();
                 attachServerMeta(result);
                 return makeResultResponse(*id, std::move(result));
             } catch (const McpProtocolException &pe) {
                 return *makeErrorResponse(id, pe.code, pe.what(), pe.data);
+            } catch (const ServeException &se) {
+                return *makeErrorResponse(id, se.code, se.what(), se.data);
             }
         }
 
@@ -1058,8 +672,8 @@ class PluginApp {
                 return *authErr;
             }
             std::unique_lock<std::mutex> execLock;
-            if (concurrency == ConcurrencyPolicy::Serialized && runtime_) {
-                execLock = std::unique_lock<std::mutex>(runtime_->execMutex);
+            if (concurrency == ConcurrencyPolicy::Serialized) {
+                execLock = std::unique_lock<std::mutex>(execMutex());
             }
             if (ctx.cancellation.isCancelled()) {
                 return *makeErrorResponse(id, McpErrorCode::RequestCancelled, "Request cancelled");
@@ -1083,6 +697,8 @@ class PluginApp {
                 return makeResultResponse(*id, std::move(result));
             } catch (const McpProtocolException &pe) {
                 return *makeErrorResponse(id, pe.code, pe.what(), pe.data);
+            } catch (const ServeException &se) {
+                return *makeErrorResponse(id, se.code, se.what(), se.data);
             } catch (const std::exception &e) {
                 return *makeErrorResponse(id, McpErrorCode::InternalError,
                                           "Resource load failed: " + redact_sensitive(e.what()));
@@ -1092,409 +708,15 @@ class PluginApp {
         return *makeErrorResponse(id, McpErrorCode::MethodNotFound, "Method not found: " + method);
     }
 
-    /** Runs stdio NDJSON transport over custom or standard streams, with non-blocking cancellation support. */
-    void serveMcpStdio(std::istream &in = std::cin,
-                       std::ostream &out = std::cout,
-                       std::ostream &err = std::cerr) const {
-        struct StdioState {
-            std::mutex outMutex;
-            std::mutex queueMutex;
-            std::condition_variable queueCv;
-            std::queue<std::function<void()>> queue;
-            bool stopping{false};
-            std::mutex inflightMutex;
-            std::unordered_map<std::string, std::shared_ptr<CancellationSource>> inflight;
-        };
-
-        auto state = std::make_shared<StdioState>();
-        auto writeLine = [state, &out](const Json &msg) {
-            std::string raw = slimr::write_json(msg);
-            std::erase(raw, '\n');
-            std::erase(raw, '\r');
-            std::lock_guard lock(state->outMutex);
-            out << raw << "\n"
-                << std::flush;
-        };
-
-        static constexpr size_t kWorkerCount = 4;
-        std::vector<std::thread> workers;
-        workers.reserve(kWorkerCount);
-        for (size_t i = 0; i < kWorkerCount; ++i) {
-            workers.emplace_back([state]() {
-                for (;;) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock lock(state->queueMutex);
-                        state->queueCv.wait(lock, [&]() {
-                            return state->stopping || !state->queue.empty();
-                        });
-                        if (state->queue.empty() && state->stopping)
-                            return;
-                        task = std::move(state->queue.front());
-                        state->queue.pop();
-                    }
-                    if (task)
-                        task();
-                }
-            });
-        }
-
-        auto joinWorkers = [&]() {
-            {
-                std::lock_guard lock(state->queueMutex);
-                state->stopping = true;
-            }
-            state->queueCv.notify_all();
-            for (auto &w : workers) {
-                if (w.joinable())
-                    w.join();
-            }
-        };
-
-        std::string line;
-        try {
-            while (std::getline(in, line)) {
-                mcp_detail::strip_trailing_ws(line);
-                if (line.empty())
-                    continue;
-
-                auto parsed = parse_json<Json>(line);
-                if (!parsed) {
-                    writeLine(*makeErrorResponse(std::nullopt, McpErrorCode::ParseError, "Parse error"));
-                    continue;
-                }
-
-                const Json &req = *parsed;
-                if (req.is_object() &&
-                    req.contains("jsonrpc") && req["jsonrpc"].is_string() &&
-                    req["jsonrpc"].get<std::string>() == "2.0" &&
-                    !req.contains("id") &&
-                    req.contains("method") && req["method"].is_string() &&
-                    req["method"].get<std::string>() == "notifications/cancelled") {
-                    if (req.contains("params") && req["params"].is_object() &&
-                        req["params"].contains("requestId") &&
-                        mcp_detail::is_valid_rpc_id(req["params"]["requestId"])) {
-                        std::string keyId = mcp_detail::id_key(req["params"]["requestId"]);
-                        std::shared_ptr<CancellationSource> src;
-                        {
-                            std::lock_guard lock(state->inflightMutex);
-                            if (auto it = state->inflight.find(keyId); it != state->inflight.end()) {
-                                src = it->second;
-                            }
-                        }
-                        if (src) {
-                            src->cancel();
-                        }
-                    }
-                    continue;
-                }
-
-                const bool trackRequest = req.is_object() && req.contains("id") &&
-                                          mcp_detail::is_valid_rpc_id(req["id"]);
-                std::optional<std::string> keyId;
-                auto cancelSrc = std::make_shared<CancellationSource>();
-                if (trackRequest) {
-                    keyId = mcp_detail::id_key(req["id"]);
-                    std::lock_guard lock(state->inflightMutex);
-                    state->inflight[*keyId] = cancelSrc;
-                }
-
-                {
-                    std::lock_guard lock(state->queueMutex);
-                    state->queue.push([this, state, writeLine, &err, req, keyId, cancelSrc]() {
-                        RequestContext baseCtx;
-                        baseCtx.cancellation = cancelSrc->token();
-                        auto channel = std::make_shared<McpNotificationChannel>(
-                            [writeLine, tok = baseCtx.cancellation](const Json &notif) {
-                                if (!tok.isCancelled()) {
-                                    writeLine(notif);
-                                }
-                            });
-                        baseCtx.notificationChannel = channel;
-
-                        Json resp;
-                        try {
-                            resp = dispatchMcpJson(req, baseCtx);
-                        } catch (const std::exception &e) {
-                            std::string safeErr = redact_sensitive(e.what());
-                            err << "mcp dispatch error: " << safeErr << "\n"
-                                << std::flush;
-                            if (keyId.has_value()) {
-                                resp = *makeErrorResponse(req["id"], McpErrorCode::InternalError, safeErr);
-                            }
-                        } catch (...) {
-                            err << "mcp dispatch unknown error\n"
-                                << std::flush;
-                            if (keyId.has_value()) {
-                                resp = *makeErrorResponse(req["id"], McpErrorCode::InternalError, "Internal error");
-                            }
-                        }
-
-                        channel->close();
-
-                        if (keyId.has_value()) {
-                            std::lock_guard lock(state->inflightMutex);
-                            state->inflight.erase(*keyId);
-                        }
-
-                        if (!resp.empty() && !cancelSrc->isCancelled()) {
-                            writeLine(resp);
-                        }
-                    });
-                }
-                state->queueCv.notify_one();
-            }
-        } catch (...) {
-            joinWorkers();
-            throw;
-        }
-        joinWorkers();
+    int run(int argc, char *argv[], std::ostream &out = std::cout, std::ostream &err = std::cerr, std::istream &in = std::cin) {
+        return slimr::run_cli(*this, argc, argv, out, err, in);
     }
 
-    int run(int argc, char *argv[]) {
-        if (!bugsinkDsn.empty() && !bugsink()) {
-            setBugsink(bugsinkDsn);
-        }
-
-        bool skipChecks = false;
-        std::vector<char *> filteredArgv;
-        filteredArgv.reserve(static_cast<size_t>(argc > 0 ? argc : 1));
-        if (argc > 0 && argv != nullptr) {
-            filteredArgv.push_back(argv[0]);
-            for (int i = 1; i < argc; ++i) {
-                if (argv[i] != nullptr && std::strcmp(argv[i], "--skip-checks") == 0) {
-                    skipChecks = true;
-                } else {
-                    filteredArgv.push_back(argv[i]);
-                }
-            }
-        }
-        int fArgc = static_cast<int>(filteredArgv.size());
-
-        if (fArgc <= 1 || (fArgc == 2 && (std::strcmp(filteredArgv[1], "--help") == 0 ||
-                                          std::strcmp(filteredArgv[1], "-h") == 0 ||
-                                          std::strcmp(filteredArgv[1], "--list") == 0))) {
-            printHelp();
-            return 0;
-        }
-
-        if (fArgc == 2 && std::strcmp(filteredArgv[1], "--version") == 0) {
-            std::cout << (key.empty() ? "app" : key) << " " << version << "\n";
-            return 0;
-        }
-
-        if (!skipChecks && !requiredEnvVars.empty()) {
-            std::vector<const RequiredEnvVar *> missing;
-            for (const auto &req : requiredEnvVars) {
-                const char *val = std::getenv(req.name.c_str());
-                if (val == nullptr || val[0] == '\0') {
-                    missing.push_back(&req);
-                }
-            }
-            if (!missing.empty()) {
-                std::cerr << "Missing required environment variable(s):\n";
-                for (const auto *req : missing) {
-                    std::cerr << "  " << req->name;
-                    if (!req->purpose.empty()) {
-                        std::cerr << ": " << req->purpose;
-                    }
-                    std::cerr << "\n";
-                }
-                return 1;
-            }
-        }
-
-        std::string firstArg = filteredArgv[1];
-        if (firstArg == "mcp") {
-            serveMcpStdio();
-            return 0;
-        }
-
-        if (firstArg == "http") {
-            if (!httpRunner_) {
-                std::cerr << "HTTP transport is not enabled in this binary (link slimr::mcp_http).\n";
-                return 1;
-            }
-            return httpRunner_(*this, fArgc, filteredArgv.data());
-        }
-
-        // CLI invocation of tool: <bin> <tool> ['{"arg":"val"}' | @path | -]
-        if (!allowCliTools) {
-            std::string prog = key.empty() ? "app" : key;
-            std::cerr << "CLI tool calls are disabled for " << prog << "; use 'mcp' or 'http'\n";
-            return 1;
-        }
-
-        const ToolDef *def = findTool(firstArg);
-        if (!def) {
-            std::cerr << "Unknown tool: " << firstArg << "\n";
-            printHelp();
-            return 1;
-        }
-
-        Json args = json_obj();
-        RequestContext cliCtx;
-        if (fArgc >= 3) {
-            std::string rawJson;
-            std::string_view rawArg = filteredArgv[2];
-            if (rawArg == "-") {
-                std::ostringstream ss;
-                ss << std::cin.rdbuf();
-                if (std::cin.bad()) {
-                    std::cerr << "Failed to read arguments from stdin\n";
-                    return 1;
-                }
-                rawJson = ss.str();
-            } else if (rawArg.starts_with('@')) {
-                if (rawArg.size() == 1) {
-                    std::cerr << "Invalid @path argument: missing file path\n";
-                    return 1;
-                }
-                std::filesystem::path filePath(rawArg.substr(1));
-                std::error_code ec;
-                if (std::filesystem::is_directory(filePath, ec)) {
-                    std::cerr << "Argument path is a directory: " << filePath.string() << "\n";
-                    return 1;
-                }
-                std::ifstream file(filePath, std::ios::binary);
-                if (!file) {
-                    std::cerr << "Failed to open argument file: " << filePath.string() << "\n";
-                    return 1;
-                }
-                std::ostringstream ss;
-                ss << file.rdbuf();
-                if (file.bad()) {
-                    std::cerr << "Failed to read argument file: " << filePath.string() << "\n";
-                    return 1;
-                }
-                rawJson = ss.str();
-            } else {
-                rawJson = std::string(rawArg);
-            }
-
-            auto parsed = parse_json<Json>(rawJson);
-            if (!parsed) {
-                std::cerr << "Invalid JSON arguments: " << parsed.error() << "\n";
-                return 1;
-            }
-            if (!parsed->is_object()) {
-                std::cerr << "CLI arguments must be a JSON object\n";
-                return 1;
-            }
-
-            const bool schemaHasInput = def->inputSchema.is_object() &&
-                                        def->inputSchema.contains("properties") &&
-                                        def->inputSchema["properties"].is_object() &&
-                                        def->inputSchema["properties"].contains("input");
-            const bool schemaHasContext = def->inputSchema.is_object() &&
-                                          def->inputSchema.contains("properties") &&
-                                          def->inputSchema["properties"].is_object() &&
-                                          def->inputSchema["properties"].contains("context");
-            const bool hasContext = parsed->contains("context");
-            const bool hasInput = parsed->contains("input");
-            const bool isEnvelope = (hasContext && !(schemaHasContext && !(*parsed)["context"].is_object())) ||
-                                    (hasInput && !schemaHasInput);
-
-            if (isEnvelope) {
-                for (const auto &[k, v] : parsed->get_object()) {
-                    (void)v;
-                    if (k != "input" && k != "context") {
-                        std::cerr << "Invalid CLI envelope key: " << k << "\n";
-                        return 1;
-                    }
-                }
-                if (hasInput) {
-                    if (!(*parsed)["input"].is_object()) {
-                        std::cerr << "CLI envelope 'input' must be a JSON object\n";
-                        return 1;
-                    }
-                    args = (*parsed)["input"];
-                } else {
-                    args = json_obj();
-                }
-                if (hasContext) {
-                    const Json &ctxJson = (*parsed)["context"];
-                    if (!ctxJson.is_object()) {
-                        std::cerr << "CLI envelope 'context' must be a JSON object\n";
-                        return 1;
-                    }
-                    for (const auto &[k, v] : ctxJson.get_object()) {
-                        if (k != "session") {
-                            std::cerr << "Invalid CLI context key: " << k << "\n";
-                            return 1;
-                        }
-                        if (!v.is_string() && !v.is_object()) {
-                            std::cerr << "CLI context 'session' must be a string or object\n";
-                            return 1;
-                        }
-                        cliCtx.session = v;
-                    }
-                }
-            } else {
-                args = *parsed;
-            }
-        }
-
-        if (auto authErr = checkAuthorization(cliCtx.principal, def->requiredScopes, "tools/call:" + def->name, std::nullopt)) {
-            std::string msg = "Forbidden";
-            if (authErr->is_object() && authErr->contains("error") && (*authErr)["error"].is_object() &&
-                (*authErr)["error"].contains("message") && (*authErr)["error"]["message"].is_string()) {
-                msg = (*authErr)["error"]["message"].get_string();
-            }
-            std::cerr << msg << "\n";
-            return 1;
-        }
-
-        McpResult res;
-        try {
-            res = def->handler(args, cliCtx);
-        } catch (const std::exception &e) {
-            std::cerr << redact_sensitive(e.what()) << "\n";
-            return 1;
-        }
-
-        if (res.isError) {
-            for (const auto &b : res.content) {
-                std::cerr << b.text << "\n";
-            }
-            return 1;
-        }
-
-        for (const auto &b : res.content) {
-            if (b.type == "text") {
-                std::cout << b.text << "\n";
-            } else {
-                std::cout << slimr::write_json(content_to_json(b)) << "\n";
-            }
-        }
-        return 0;
-    }
-
-    void printHelp() const {
-        std::string prog = key.empty() ? "app" : key;
-        std::cout << "Usage:\n";
-        std::cout << "  " << prog << " [--skip-checks] mcp\n";
-        if (httpRunner_) {
-            std::cout << "  " << prog << " [--skip-checks] http [--host <addr>] [--port <n>]\n";
-        }
-        if (allowCliTools) {
-            std::cout << "  " << prog << " [--skip-checks] <tool> ['{\"arg\":\"val\"}' | @path | -]\n";
-        }
-        std::cout << "  " << prog << " --version | --help\n\n";
-        std::cout << "Available tools:\n";
-        for (const auto &[name, def] : tools_) {
-            (void)name;
-            std::cout << "  " << def.name << " - " << def.description << "\n";
-            std::cout << "    Schema: " << slimr::write_json(def.inputSchema) << "\n";
-        }
+    void printHelp(std::ostream &os = std::cout) const {
+        slimr::print_cli_help(*this, os);
     }
 
   private:
-    struct RuntimeState {
-        std::shared_ptr<BugsinkReporter> bugsink;
-        std::mutex execMutex;
-    };
-
     Json serverInfoJson() const {
         Json info = json_obj();
         info["name"] = key.empty() ? "plugin-app" : key;
@@ -1521,7 +743,7 @@ class PluginApp {
 
     Json buildDiscoverResult() const {
         Json caps = json_obj();
-        if (!tools_.empty() || !resources.empty()) {
+        if (!tools().empty() || !resources.empty()) {
             caps["tools"] = json_obj();
         }
         if (!resources.empty()) {
@@ -1534,6 +756,9 @@ class PluginApp {
         if (!instructions.empty()) {
             result["instructions"] = instructions;
         }
+        if (apiVersion > 0) {
+            result["apiVersion"] = apiVersion;
+        }
         result["ttlMs"] = cachePolicy.discoverTtlMs;
         result["cacheScope"] = cachePolicy.discoverCacheScope;
         attachServerMeta(result);
@@ -1544,41 +769,19 @@ class PluginApp {
                                            std::span<const std::string> toolScopes,
                                            std::string_view operation,
                                            const std::optional<Json> &id) const {
-        if (!principal.authenticated) {
+        auto authErr = slimr::checkAuthorization(*this, principal, toolScopes, operation);
+        if (!authErr) {
             return std::nullopt;
         }
-        std::vector<std::string> missing;
-        for (const auto &s : defaultRequiredScopes) {
-            if (!principal.hasScope(s))
-                missing.push_back(s);
-        }
-        for (const auto &s : toolScopes) {
-            if (!principal.hasScope(s))
-                missing.push_back(s);
-        }
-        if (!missing.empty()) {
-            Json data = json_obj();
+        Json data = json_obj();
+        if (!authErr->requiredScopes.empty()) {
             Json::array_t arr;
-            for (const auto &m : missing)
+            for (const auto &m : authErr->requiredScopes)
                 arr.emplace_back(m);
             data["requiredScopes"] = json_arr(std::move(arr));
-            return makeErrorResponse(id, McpErrorCode::InsufficientScope,
-                                     "Insufficient scope for " + std::string(operation),
-                                     std::move(data));
         }
-        if (authorizer) {
-            std::string errMsg;
-            if (!authorizer(principal, operation, errMsg)) {
-                return makeErrorResponse(id, McpErrorCode::InsufficientScope,
-                                         errMsg.empty() ? "Forbidden" : errMsg);
-            }
-        }
-        return std::nullopt;
+        return makeErrorResponse(id, authErr->code, authErr->message, std::move(data));
     }
-
-    std::map<std::string, ToolDef> tools_;
-    std::shared_ptr<RuntimeState> runtime_;
-    HttpRunnerFn httpRunner_;
 };
 
 } // namespace slimr
