@@ -128,7 +128,7 @@ cancelled requests are closed without a final response.
 
 Once the drain window ends (or all in-flight jobs and responses finish),
 `stop()` closes the listener, joins the accept thread, and joins the worker
-threads. Socket writes use a 1-second write timeout so stalled clients cannot
+threads. Socket writes use a 500 ms write timeout so stalled clients cannot
 block shutdown indefinitely. Handlers must observe cancellation and return:
 the grace period is **not** a hard bound on `stop()` because workers are never
 detached or forcibly terminated.

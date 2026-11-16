@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Docs: fix HTTP socket write timeout in README (500 ms).
+
 ## v0.1.4 - 2026-11-16
 
 - Opt-in CLI tool calls (`PluginApp::allowCliTools{false}`), `RequestContext::session`, `{"input":...,"context":...}` envelope unwrapping, and `@path` / `-` (stdin) input.
