@@ -1,4 +1,4 @@
-# slimr::mcp (`packages/mcp`)
+# slimr::mcp
 
 MCP-first C++26 framework (`2026-07-28` specification) turning reflected C++ structs into a stdio MCP server, a standalone Streamable HTTP + OAuth Resource Server daemon (`slimr::mcp_http`), and a narrow JSON CLI.
 
@@ -16,7 +16,30 @@ Traditional CLI frameworks pull in thousands of lines of flag parsing that AI ag
 3. **Native MCP Media & Security:** Return `McpResult::image(base64, mime)` or `McpResult::audio(base64, mime)` directly from tool handlers. Sensitive bearer tokens and secrets are redacted from internal error/log strings (`redact_sensitive`).
 4. **Built-in Bugsink Reporting:** Unhandled exceptions in tool handlers are reported cleanly when `app.setBugsink(dsn)` is configured.
 
----
+## Install
+
+Add `bdombro/slimr-mcp` to `vcpkg-configuration.json`:
+
+```json
+{
+  "kind": "git",
+  "repository": "https://github.com/bdombro/slimr-mcp",
+  "baseline": "<commit-sha>",
+  "packages": [
+    "slimr-mcp",
+    "libhv"
+  ]
+}
+```
+
+Declare `slimr-mcp` in `vcpkg.json` and link `slimr::mcp` (or `slimr::mcp_http` with feature `"http"`) in `CMakeLists.txt`:
+
+```cmake
+find_package(slimr-mcp CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE slimr::mcp)
+```
+
+When using the `"http"` feature, list `"packages": ["slimr-mcp", "libhv"]` on the `slimr-mcp` registry entry so `libhv` resolves from this registry.
 
 ## Quick Start
 
@@ -74,7 +97,7 @@ Use `slimr::mcp` alone for stdio+CLI, or link `slimr::mcp_http` (via the `"http"
 int main(int argc, char** argv) {
     auto app = make_greet_app();
     slimr::HttpServerOptions httpOpts;
-    httpOpts.host = "127.0.0.1";
+    httpOpts.host = "127.0.0.1"; // optional override (defaults to "0.0.0.0")
     httpOpts.port = 10001;
     // Configure httpOpts.oauth (OAuthResourceConfig) for RFC 9728 metadata,
     // bearer validation, and required scopes. Consumers own any AS endpoints
@@ -89,7 +112,7 @@ int main(int argc, char** argv) {
 ## Resource Server OAuth & Security Boundaries
 
 - **Standard Resource Server (`mcp_oauth.hpp`):** `OAuthResourceConfig` fails closed when enabled: bearer tokens must come in the `Authorization: Bearer ...` header (`?access_token=` is rejected with `401`), and `TokenValidationResult` checks issuer, audience, expiration, and required tool scopes (`403 insufficient_scope`). `/.well-known/oauth-protected-resource` advertises RFC 9728 metadata without requiring auth.
-- **Authorization Server ownership:** `packages/mcp` deliberately does **not** ship a hosted IdP, credential broker, or database persistence. Applications needing an authorization flow (consent/pairing UI, PKCE token issuance) mount explicit routes via `HttpServerOptions::customRoutes` or point `authorizationServers` to an external AS.
+- **Authorization Server ownership:** `slimr::mcp` deliberately does **not** ship a hosted IdP, credential broker, or database persistence. Applications needing an authorization flow (consent/pairing UI, PKCE token issuance) mount explicit routes via `HttpServerOptions::customRoutes` or point `authorizationServers` to an external AS.
 - **HTTP server defaults:** Binds `0.0.0.0` with ephemeral port `0` by default, static serving disabled, bounded worker threads/queue (`503` on saturation while keeping fast `server/discover` responsive), `maxBodyBytes` `413` enforcement, and incremental chunked SSE with bounded backpressure (`sseHighWaterBytes`) and cooperative `shutdownTimeoutMs` drain.
 
 ### HTTP shutdown
@@ -125,34 +148,12 @@ never detached or forcibly terminated.
 | Attach Streamable HTTP CLI subcommand | `slimr::enable_http(app, httpOpts)` (links `slimr::mcp_http`) |
 | Run CLI, `mcp`, or `http` | `app.run(argc, argv)` |
 
-## Install
+## Environment Variables
 
-Add `bdombro/slimr-mcp` to `vcpkg-configuration.json`:
+| Name | Required | Purpose |
+| --- | --- | --- |
+| `BUGSINK_DSN` | Optional | Bugsink DSN read when `PluginApp::setBugsink("", "BUGSINK_DSN", release)` is configured. |
 
-```json
-{
-  "kind": "git",
-  "repository": "https://github.com/bdombro/slimr-mcp",
-  "baseline": "<commit-sha>",
-  "packages": [
-    "slimr-mcp",
-    "libhv"
-  ]
-}
-```
+## Development
 
-Declare `slimr-mcp` in `vcpkg.json` and link `slimr::mcp (or slimr::mcp_http with feature "http")` in `CMakeLists.txt`:
-
-```cmake
-find_package(slimr-mcp CONFIG REQUIRED)
-target_link_libraries(my_target PRIVATE slimr::mcp)
-```
-
-When using the `"http"` feature, list `"packages": ["slimr-mcp", "libhv"]` on the `slimr-mcp` registry entry so `libhv` resolves from this registry.
-
-## Build & Test
-
-```bash
-just test   # Debug build (ASan + UBSan) and run tests
-just build  # Optimized Release build
-```
+See [docs/development.md](docs/development.md) for building, testing, linting, and releasing.
