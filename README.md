@@ -18,12 +18,12 @@ Traditional CLI frameworks pull in thousands of lines of flag parsing that AI ag
 
 ## Install
 
-Add `bdombro/slimr-mcp` to `vcpkg-configuration.json`:
+Add `slimr-down-now/mcp` to `vcpkg-configuration.json`:
 
 ```json
 {
   "kind": "git",
-  "repository": "https://github.com/bdombro/slimr-mcp",
+  "repository": "https://github.com/slimr-down-now/mcp",
   "baseline": "<commit-sha>",
   "packages": [
     "slimr-mcp",
