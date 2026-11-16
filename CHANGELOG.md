@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.1.3 - 2026-11-16
+
 - Replace `libhv` and `slimr-curl` with `cpp-httplib[openssl]` (`httplib::Server`).
 - Internal: switch macOS builds to llvm@23 with static libc++.
 - Internal: harden CLI rdbuf guard and InvalidRequest test assertion.
