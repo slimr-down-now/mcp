@@ -6,7 +6,7 @@
   "registries": [
     {
       "kind": "git",
-      "baseline": "c73a85e6b82705570c1e6a7b58b05cb9f77dc638",
+      "baseline": "f67d2314ed79bfb2b9d15fe3582a9e174b035b6e",
       "repository": "https://github.com/slimr-down-now/serve.git",
       "packages": [
         "slimr-serve"

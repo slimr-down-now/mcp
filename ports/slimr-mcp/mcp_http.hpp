@@ -565,6 +565,7 @@ class McpHttpServer {
 /** Attaches standalone `serve` / `http` subcommands and CLI relay to PluginApp. */
 inline void enable_http(PluginApp &app, McpHttpOptions defaults = {}) {
     enable_cli_relay(app);
+    app.openApiDefaults.oauthEnabled = defaults.oauth.enabled;
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &targetBase, int argc, char **argv) -> int {
         auto &target = static_cast<PluginApp &>(targetBase);
         McpHttpOptions opts = defaults;

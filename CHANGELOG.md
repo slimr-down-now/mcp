@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Forward OAuth OpenAPI defaults in `enable_http`, test `GET /openapi.json` and `--openapi`, and bump `slimr-serve` to `>= 0.2.0`.
+- Docs: document `GET /openapi.json`, `--openapi`, and overlay-port development workflow in README.
+- Internal: fix broken docs link in README.
+
 ## v0.2.0 - 2026-11-16
 
 - Refactor `slimr-mcp` as an HTTP-only MCP `2026-07-28` adapter on `slimr-serve` (`structuredContent`/`outputSchema` for typed outputs, `apiVersion` in `server/discover`, Unix socket OAuth bypass) and remove stdio transport (`<bin> mcp`).

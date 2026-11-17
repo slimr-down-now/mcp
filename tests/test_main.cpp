@@ -991,6 +991,61 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
         CHECK(runCli({"cli-app", "boom", R"({"msg":"x"})"}, nullptr, &e) == 1);
         CHECK(e.find("Bearer [REDACTED]") != std::string::npos);
     }
+
+    TEST_CASE("PluginApp --openapi bypasses allowCliTools/requiredEnvVars and reflects enable_http oauth") {
+        PluginApp app("openapi-cli", "2.0.0");
+        app.description = "OpenAPI CLI test";
+        app.requireEnv("SLIMR_MCP_TEST_MISSING_OPENAPI_ENV", "missing env var");
+        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
+            Json res = json_obj();
+            res["sum"] = in.a.get() + in.b.get();
+            return res;
+        });
+        CHECK(app.allowCliTools == false);
+
+        auto runOpenApi = [&]() {
+            std::string arg0 = "openapi-cli";
+            std::string arg1 = "--openapi";
+            std::vector<char *> argv{arg0.data(), arg1.data()};
+            std::ostringstream capOut;
+            std::ostringstream capErr;
+            struct OstreamGuard {
+                std::ostream &stream;
+                std::streambuf *prev;
+                ~OstreamGuard() { stream.rdbuf(prev); }
+            };
+            OstreamGuard outGuard{std::cout, std::cout.rdbuf(capOut.rdbuf())};
+            OstreamGuard errGuard{std::cerr, std::cerr.rdbuf(capErr.rdbuf())};
+            int rc = app.run(static_cast<int>(argv.size()), argv.data());
+            CHECK(capErr.str().empty());
+            CHECK(rc == 0);
+            return slimr::parse_json(capOut.str());
+        };
+
+        auto spec = runOpenApi();
+        REQUIRE(spec.has_value());
+        CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+        CHECK((*spec)["info"]["title"].get<std::string>() == "openapi-cli");
+        CHECK((*spec)["info"]["version"].get<std::string>() == "2.0.0");
+        CHECK((*spec)["paths"].contains("/add"));
+        CHECK((*spec)["paths"]["/add"].contains("post"));
+        CHECK_FALSE((*spec).contains("servers"));
+        CHECK_FALSE((*spec).contains("security"));
+        CHECK_FALSE((*spec)["components"].contains("securitySchemes"));
+        CHECK_FALSE((*spec)["paths"]["/add"]["post"]["responses"].contains("401"));
+
+#ifdef SLIMR_MCP_HAS_HTTP
+        McpHttpOptions httpOpts;
+        httpOpts.oauth.enabled = true;
+        enable_http(app, std::move(httpOpts));
+        auto oauthSpec = runOpenApi();
+        REQUIRE(oauthSpec.has_value());
+        CHECK((*oauthSpec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
+        CHECK((*oauthSpec).contains("security"));
+        CHECK((*oauthSpec)["paths"]["/add"]["post"]["responses"].contains("401"));
+        CHECK((*oauthSpec)["paths"]["/add"]["post"]["responses"].contains("403"));
+#endif
+    }
 }
 
 #ifdef SLIMR_MCP_HAS_HTTP
@@ -2012,6 +2067,81 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         auto insuff = evalTok("missing-scope");
         CHECK(insuff.status == TokenValidationResult::Status::InsufficientScope);
         CHECK(insuff.requiredScopes == std::vector<std::string>{"mcp:read"});
+    }
+
+    TEST_CASE("McpHttpServer GET /openapi.json unauthenticated with and without OAuth") {
+        // 1. Without OAuth
+        {
+            PluginApp app("openapi-http", "1.4.0");
+            app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
+                Json res = json_obj();
+                res["sum"] = in.a.get() + in.b.get();
+                return res;
+            });
+
+            McpHttpOptions opts;
+            opts.host = "127.0.0.1";
+            opts.port = 0;
+            McpHttpServer srv(app, opts);
+            std::string err;
+            REQUIRE(srv.start(&err));
+            uint16_t port = srv.boundPort();
+            REQUIRE(port != 0);
+
+            auto rGet = http_exchange(port, "GET", "/openapi.json", {{"Connection", "close"}}, "");
+            CHECK(rGet.status == 200);
+            auto spec = slimr::parse_json(rGet.body);
+            REQUIRE(spec.has_value());
+            CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+            CHECK((*spec)["info"]["title"].get<std::string>() == "openapi-http");
+            CHECK((*spec)["info"]["version"].get<std::string>() == "1.4.0");
+            CHECK((*spec)["paths"]["/add"].contains("post"));
+            CHECK_FALSE((*spec).contains("security"));
+            CHECK_FALSE((*spec)["components"].contains("securitySchemes"));
+
+            auto rPost = http_exchange(port, "POST", "/openapi.json",
+                                       {{"Content-Type", "application/json"}, {"Connection", "close"}}, "{}");
+            CHECK(rPost.status == 405);
+            CHECK(rPost.headers["allow"] == "GET");
+
+            srv.stop();
+        }
+
+        // 2. With OAuth enabled: GET /openapi.json stays unauthenticated and advertises bearerAuth
+        {
+            PluginApp app("openapi-oauth", "1.5.0");
+            app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
+                Json res = json_obj();
+                res["sum"] = in.a.get() + in.b.get();
+                return res;
+            });
+
+            McpHttpOptions opts;
+            opts.host = "127.0.0.1";
+            opts.port = 0;
+            opts.oauth.enabled = true;
+            opts.oauth.expectedIssuers = {"https://auth.example.com"};
+            opts.oauth.validateToken = [](const TokenValidationContext &) {
+                return TokenValidationResult{.status = TokenValidationResult::Status::InvalidToken};
+            };
+            McpHttpServer srv(app, opts);
+            std::string err;
+            REQUIRE(srv.start(&err));
+            uint16_t port = srv.boundPort();
+            REQUIRE(port != 0);
+
+            auto rGet = http_exchange(port, "GET", "/openapi.json", {{"Connection", "close"}}, "");
+            CHECK(rGet.status == 200);
+            auto spec = slimr::parse_json(rGet.body);
+            REQUIRE(spec.has_value());
+            CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
+            CHECK((*spec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
+            CHECK((*spec).contains("security"));
+            CHECK((*spec)["paths"]["/add"]["post"]["responses"].contains("401"));
+            CHECK((*spec)["paths"]["/add"]["post"]["responses"].contains("403"));
+
+            srv.stop();
+        }
     }
 }
 
