@@ -20,6 +20,7 @@ namespace slimr {
 /** Extended HTTP options for McpHttpServer; implicitly converts from ServeHttpOptions (HttpServerOptions). */
 struct McpHttpOptions : ServeHttpOptions {
     std::string mcpPath{"/mcp"};
+    bool tools{true}; // Mount /tools/<tool>, /tools/openapi.json, /tools/schema (plugins ignore inherited toolRoutes/toolsPrefix)
     size_t maxPendingJobs{32};
     size_t sseHighWaterBytes{32768};
     size_t sseMaxWriteBufBytes{65536};
@@ -193,6 +194,32 @@ class McpHttpServer {
         ServeHttpOptions serveOpts = static_cast<const ServeHttpOptions &>(opts_);
         if (!serveOpts.port.has_value() && serveOpts.socketPath.empty()) {
             serveOpts.port = 0;
+        }
+        serveOpts.toolRoutes = opts_.tools;
+        serveOpts.toolsPrefix = "/tools";
+        if (!opts_.publicBaseUrl.empty() || (opts_.port && *opts_.port > 0)) {
+            serveOpts.oauth.expectedResource = mcpEndpointUrl();
+        } else if (serveOpts.oauth.enabled && serveOpts.oauth.validateToken) {
+            serveOpts.oauth.expectedResource.clear();
+            // Resolve mcpEndpointUrl() dynamically once boundPort() is known for ephemeral ports (--port 0).
+            auto origValidator = std::move(serveOpts.oauth.validateToken);
+            serveOpts.oauth.validateToken = [this, origValidator = std::move(origValidator)](const TokenValidationContext &tctx) -> TokenValidationResult {
+                std::string mcpRes = mcpEndpointUrl();
+                TokenValidationContext fwd = tctx;
+                fwd.expectedResource = mcpRes;
+                TokenValidationResult res = origValidator(fwd);
+                if (res.status == TokenValidationResult::Status::Valid && !res.principal.audience.empty()) {
+                    if (res.principal.audience != mcpRes) {
+                        TokenValidationResult fail;
+                        fail.status = TokenValidationResult::Status::InvalidToken;
+                        fail.errorDescription = "Token audience does not match resource";
+                        return fail;
+                    }
+                    // Satisfy ServeHttpServer's baseUrl() check when expectedResource was unknown at construction.
+                    res.principal.audience = std::string(tctx.expectedResource);
+                }
+                return res;
+            };
         }
 
         // Mount POST /mcp + 405 handlers + OAuth PRM routes via customRoutes (registered before POST /:tool).
@@ -562,10 +589,8 @@ class McpHttpServer {
     std::atomic<uint16_t> boundPort_{0};
 };
 
-/** Attaches standalone `serve` / `http` subcommands and CLI relay to PluginApp. */
+/** Attaches standalone `serve` / `http` subcommands to PluginApp. */
 inline void enable_http(PluginApp &app, McpHttpOptions defaults = {}) {
-    enable_cli_relay(app);
-    app.openApiDefaults.oauthEnabled = defaults.oauth.enabled;
     app.setHttpRunner([defaults = std::move(defaults)](ServeApp &targetBase, int argc, char **argv) -> int {
         auto &target = static_cast<PluginApp &>(targetBase);
         McpHttpOptions opts = defaults;

@@ -1,7 +1,7 @@
 {
   "name": "slimr-mcp",
   "version": "0.2.1",
-  "description": "Header-only typed MCP servers and JSON CLIs",
+  "description": "Header-only typed MCP servers",
   "dependencies": [
     {
       "name": "slimr-bugsink",
@@ -17,7 +17,7 @@
     },
     {
       "name": "slimr-serve",
-      "version>=": "0.2.0"
+      "version>=": "0.3.1"
     }
   ],
   "features": {
@@ -36,7 +36,7 @@
           "features": [
             "http"
           ],
-          "version>=": "0.2.0"
+          "version>=": "0.3.1"
         }
       ]
     },
@@ -55,7 +55,7 @@
           "features": [
             "http"
           ],
-          "version>=": "0.2.0"
+          "version>=": "0.3.1"
         },
         {
           "name": "slimr-test",
