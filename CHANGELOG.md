@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-11-17
+
 - Forward OAuth OpenAPI defaults in `enable_http`, test `GET /openapi.json` and `--openapi`, and bump `slimr-serve` to `>= 0.2.0`.
 - Docs: document `GET /openapi.json`, `--openapi`, and overlay-port development workflow in README.
 - Internal: fix broken docs link in README.
