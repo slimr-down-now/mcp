@@ -1,6 +1,6 @@
 # slimr-mcp
 
-Header-only typed MCP servers and JSON CLIs
+Header-only typed MCP servers
 
 <!-- cpp-templates:begin -->
 <!-- cpp-templates:commit c746b02c9f5b17b63c4921e6adff7fa8c5f6dc37 -->

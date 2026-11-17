@@ -405,63 +405,21 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
         CHECK(notifs[1]["params"]["data"].get<std::string>().find("[REDACTED]") != std::string::npos);
     }
 
-    TEST_CASE("CLI direct invocation and redaction helper") {
-        PluginApp app("cli-app");
-        app.allowCliTools = true;
-        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
-            Json res = json_obj();
-            res["result"] = in.a.get() + in.b.get();
-            return res;
-        });
-
-        char arg0[] = "cli-app";
-        char arg1[] = "add";
-        char arg2[] = "{\"a\":15,\"b\":27}";
-        char *argv[] = {arg0, arg1, arg2, nullptr};
-
-        std::stringstream ss;
-        auto *oldBuf = std::cout.rdbuf(ss.rdbuf());
-        int code = app.run(3, argv);
-        std::cout.rdbuf(oldBuf);
-
-        CHECK(code == 0);
-        CHECK(ss.str().find("\"result\":42") != std::string::npos);
-
+    TEST_CASE("Redaction helper") {
         std::string red = redact_sensitive("Authorization: Bearer topsecret123 https://cb?code=abc123&state=ok");
         CHECK(red.find("topsecret123") == std::string::npos);
         CHECK(red.find("abc123") == std::string::npos);
         CHECK(red.find("state=ok") != std::string::npos);
     }
 
-    TEST_CASE("CLI opt-in allowCliTools, @path, stdin, and envelope context") {
-        struct HasInputField {
-            Field<std::string, "Input value"> input;
-        };
-
+    TEST_CASE("PluginApp CLI rejects tool names, --openapi, --remote, and --bearer-env") {
         bool invoked = false;
-        std::optional<std::string> seenSession;
-        bool seenAuth = false;
-
         PluginApp app("cli-ctx");
-        app.tool<AddInput>("add", "Adds", [&](const AddInput &in, const RequestContext &ctx) {
+        app.tool<AddInput>("add", "Adds", [&](const AddInput &in) {
             invoked = true;
-            seenSession = ctx.session;
-            seenAuth = ctx.principal.authenticated;
             Json res = json_obj();
             res["sum"] = in.a.get() + in.b.get();
             return res;
-        });
-        app.tool<std::monostate>("ping", "Ping", [&](const std::monostate &, const RequestContext &ctx) {
-            invoked = true;
-            seenSession = ctx.session;
-            seenAuth = ctx.principal.authenticated;
-            return "pong";
-        });
-        app.tool<HasInputField>("echo", "Echo", [&](const HasInputField &in, const RequestContext &ctx) {
-            invoked = true;
-            seenSession = ctx.session;
-            seenAuth = ctx.principal.authenticated;
-            return in.input.get();
         });
 
         auto runCli = [&](std::initializer_list<const char *> args, std::string *outBuf = nullptr, std::string *errBuf = nullptr) {
@@ -489,118 +447,18 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
             return rc;
         };
 
-        // 1) Default allowCliTools == false
-        CHECK(app.allowCliTools == false);
         std::string o;
         std::string e;
         CHECK(runCli({"cli-ctx", "--help"}, &o) == 0);
         CHECK(o.find("Available tools:") != std::string::npos);
         CHECK(o.find("<tool>") == std::string::npos);
+        CHECK(o.find("--openapi") == std::string::npos);
+        CHECK(o.find("--remote") == std::string::npos);
 
-        CHECK(runCli({"cli-ctx", "add", R"({"a":1,"b":2})"}, &o, &e) == 1);
-        CHECK(e.find("CLI tool calls are disabled for cli-ctx; use 'serve' or 'http'") != std::string::npos);
-        CHECK(invoked == false);
-
-        // 2) Opt in: help lists @path | -, non-object JSON rejected
-        app.allowCliTools = true;
-        o.clear();
-        CHECK(runCli({"cli-ctx", "--help"}, &o) == 0);
-        CHECK(o.find("<tool>") != std::string::npos);
-        CHECK(o.find("|@path|-") != std::string::npos);
-
-        CHECK(runCli({"cli-ctx", "add", "[1,2]"}, nullptr, &e) == 1);
-        CHECK(invoked == false);
-
-        // 3) @path valid, empty @, directory, missing file
-        struct TempDirGuard {
-            std::filesystem::path dir;
-            ~TempDirGuard() {
-                std::error_code ec;
-                std::filesystem::remove_all(dir, ec);
-            }
-        };
-        TempDirGuard tmp{std::filesystem::current_path() / "slimr_mcp_cli_test_tmp"};
-        std::filesystem::create_directories(tmp.dir);
-        auto jsonFile = tmp.dir / "args.json";
-        {
-            std::ofstream f(jsonFile);
-            f << R"({"a":10,"b":5})";
-        }
-        std::string atFile = "@" + jsonFile.string();
-        std::string atDir = "@" + tmp.dir.string();
-        std::string atMissing = "@" + (tmp.dir / "missing.json").string();
-
-        o.clear();
-        CHECK(runCli({"cli-ctx", "add", atFile.c_str()}, &o, &e) == 0);
-        CHECK(o.find("\"sum\":15") != std::string::npos);
-        CHECK(invoked == true);
-        CHECK(!seenSession.has_value());
-        CHECK(seenAuth == true);
-
-        invoked = false;
-        CHECK(runCli({"cli-ctx", "add", "@"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", atDir.c_str()}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", atMissing.c_str()}, nullptr, &e) == 1);
-        CHECK(invoked == false);
-
-        // 4) stdin (-) valid and invalid
-        struct IstreamGuard {
-            std::istream &stream;
-            std::streambuf *prev;
-            ~IstreamGuard() { stream.rdbuf(prev); }
-        };
-        {
-            std::istringstream in(R"({"a":7,"b":8})");
-            IstreamGuard inGuard{std::cin, std::cin.rdbuf(in.rdbuf())};
-            o.clear();
-            CHECK(runCli({"cli-ctx", "add", "-"}, &o, &e) == 0);
-            CHECK(o.find("\"sum\":15") != std::string::npos);
-        }
-        {
-            invoked = false;
-            std::istringstream in("not json");
-            IstreamGuard inGuard{std::cin, std::cin.rdbuf(in.rdbuf())};
-            CHECK(runCli({"cli-ctx", "add", "-"}, nullptr, &e) == 1);
-            CHECK(invoked == false);
-        }
-
-        // 5) Envelope with string session (omitted input allowed)
-        invoked = false;
-        o.clear();
-        CHECK(runCli({"cli-ctx", "add", R"({"input":{"a":3,"b":4},"context":{"session":"sess-1"}})"}, &o, &e) == 0);
-        CHECK(invoked == true);
-        CHECK(o.find("\"sum\":7") != std::string::npos);
-        REQUIRE(seenSession.has_value());
-        CHECK(*seenSession == "sess-1");
-        CHECK(seenAuth == true);
-
-        invoked = false;
-        o.clear();
-        CHECK(runCli({"cli-ctx", "ping", R"({"context":{"session":"s2"}})"}, &o, &e) == 0);
-        CHECK(invoked == true);
-        CHECK(o == "pong\n");
-        REQUIRE(seenSession.has_value());
-        CHECK(*seenSession == "s2");
-        CHECK(seenAuth == true);
-
-        // 6) Tool with 'input' property passes plain args through
-        invoked = false;
-        o.clear();
-        CHECK(runCli({"cli-ctx", "echo", R"({"input":"hello"})"}, &o, &e) == 0);
-        CHECK(invoked == true);
-        CHECK(o == "hello\n");
-        CHECK(!seenSession.has_value());
-
-        // 7) Invalid envelope and context cases fail without invoking handler
-        invoked = false;
-        CHECK(runCli({"cli-ctx", "add", R"({"input":{"a":1,"b":2},"extra":1})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"input":"bad"})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":"bad"})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":{"principal":{"subject":"x"}}})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":{"scopes":["admin"]}})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":{"other":"x"}})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":{"session":123}})"}, nullptr, &e) == 1);
-        CHECK(runCli({"cli-ctx", "add", R"({"context":{"session":null}})"}, nullptr, &e) == 1);
+        CHECK(runCli({"cli-ctx", "add", R"({"a":1,"b":2})"}, &o, &e) != 0);
+        CHECK(runCli({"cli-ctx", "--openapi"}, &o, &e) != 0);
+        CHECK(runCli({"cli-ctx", "--remote", "http://127.0.0.1:9999", "add"}, &o, &e) != 0);
+        CHECK(runCli({"cli-ctx", "--bearer-env", "TOK", "http"}, &o, &e) != 0);
         CHECK(invoked == false);
     }
 
@@ -622,7 +480,6 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
         unsetenv("SLIMR_TEST_REQ_B");
 
         PluginApp app("env-app", "2.3.4");
-        app.allowCliTools = true;
         app.requireEnv("SLIMR_TEST_REQ_A", "API key")
             .requireEnv("SLIMR_TEST_REQ_B", "Workspace ID");
         app.tool<std::monostate>("ping", "Ping", [](const std::monostate &) { return "pong"; });
@@ -659,7 +516,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
 
         // Missing env vars fail and list every missing var name and purpose
         std::string errMsg;
-        CHECK(run_args({"env-app", "ping"}, nullptr, &errMsg) == 1);
+        CHECK(run_args({"env-app", "http"}, nullptr, &errMsg) == 1);
         CHECK(errMsg.find("SLIMR_TEST_REQ_A") != std::string::npos);
         CHECK(errMsg.find("API key") != std::string::npos);
         CHECK(errMsg.find("SLIMR_TEST_REQ_B") != std::string::npos);
@@ -674,18 +531,18 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
         CHECK(errMsg.find("SLIMR_TEST_REQ_B") != std::string::npos);
 
         // --skip-checks bypasses env checks in leading or trailing positions
-        std::string toolOut;
-        CHECK(run_args({"env-app", "--skip-checks", "ping"}, &toolOut) == 0);
-        CHECK(toolOut == "pong\n");
-        toolOut.clear();
-        CHECK(run_args({"env-app", "ping", "--skip-checks"}, &toolOut) == 0);
-        CHECK(toolOut == "pong\n");
+        errMsg.clear();
+        CHECK(run_args({"env-app", "--skip-checks", "http"}, nullptr, &errMsg) == 1);
+        CHECK(errMsg.find("HTTP transport is not enabled") != std::string::npos);
+        errMsg.clear();
+        CHECK(run_args({"env-app", "http", "--skip-checks"}, nullptr, &errMsg) == 1);
+        CHECK(errMsg.find("HTTP transport is not enabled") != std::string::npos);
 
-        // Populated env vars allow normal execution
+        // Populated env vars pass env checks and reach the HTTP runner
         setenv("SLIMR_TEST_REQ_B", "valB", 1);
-        toolOut.clear();
-        CHECK(run_args({"env-app", "ping"}, &toolOut) == 0);
-        CHECK(toolOut == "pong\n");
+        errMsg.clear();
+        CHECK(run_args({"env-app", "http"}, nullptr, &errMsg) == 1);
+        CHECK(errMsg.find("HTTP transport is not enabled") != std::string::npos);
 
         unsetenv("SLIMR_TEST_REQ_A");
         unsetenv("SLIMR_TEST_REQ_B");
@@ -934,21 +791,10 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
 
     TEST_CASE("CLI run branches") {
         PluginApp app("cli-app", "0.2.0");
-        app.allowCliTools = true;
         app.tool<AddInput>("add", "Adds", [](const AddInput &in) {
             return std::to_string(in.a.get() + in.b.get());
         });
-        app.tool<SecretInput>("fail", "Fails", [](const SecretInput &) {
-            return McpResult::error("tool failed");
-        });
-        app.tool<SecretInput>("img", "Image", [](const SecretInput &) {
-            return McpResult::image("AQID", "image/png");
-        });
-        app.tool<SecretInput>("boom", "Boom", [](const SecretInput &) -> McpResult {
-            throw std::runtime_error("cli Bearer secret");
-        });
 
-        // CLI run() branches with redirected cout/cerr
         auto runCli = [&](std::initializer_list<const char *> args, std::string *outBuf = nullptr, std::string *errBuf = nullptr) {
             std::vector<std::string> storage;
             std::vector<char *> argv;
@@ -981,70 +827,7 @@ TEST_SUITE("MCP 2026-07-28 Protocol & Context") {
         CHECK(runCli({"cli-app", "http"}, nullptr, &e) == 1);
         CHECK(e.find("HTTP transport is not enabled") != std::string::npos);
         CHECK(runCli({"cli-app", "unknown"}, &o, &e) == 1);
-        CHECK(e.find("Unknown tool") != std::string::npos);
-        CHECK(runCli({"cli-app", "add", "{bad"}, nullptr, &e) == 1);
-        CHECK(e.find("Invalid JSON arguments") != std::string::npos);
-        CHECK(runCli({"cli-app", "fail", R"({"msg":"x"})"}, nullptr, &e) == 1);
-        CHECK(e.find("tool failed") != std::string::npos);
-        CHECK(runCli({"cli-app", "img", R"({"msg":"x"})"}, &o) == 0);
-        CHECK(o.find("image/png") != std::string::npos);
-        CHECK(runCli({"cli-app", "boom", R"({"msg":"x"})"}, nullptr, &e) == 1);
-        CHECK(e.find("Bearer [REDACTED]") != std::string::npos);
-    }
-
-    TEST_CASE("PluginApp --openapi bypasses allowCliTools/requiredEnvVars and reflects enable_http oauth") {
-        PluginApp app("openapi-cli", "2.0.0");
-        app.description = "OpenAPI CLI test";
-        app.requireEnv("SLIMR_MCP_TEST_MISSING_OPENAPI_ENV", "missing env var");
-        app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
-            Json res = json_obj();
-            res["sum"] = in.a.get() + in.b.get();
-            return res;
-        });
-        CHECK(app.allowCliTools == false);
-
-        auto runOpenApi = [&]() {
-            std::string arg0 = "openapi-cli";
-            std::string arg1 = "--openapi";
-            std::vector<char *> argv{arg0.data(), arg1.data()};
-            std::ostringstream capOut;
-            std::ostringstream capErr;
-            struct OstreamGuard {
-                std::ostream &stream;
-                std::streambuf *prev;
-                ~OstreamGuard() { stream.rdbuf(prev); }
-            };
-            OstreamGuard outGuard{std::cout, std::cout.rdbuf(capOut.rdbuf())};
-            OstreamGuard errGuard{std::cerr, std::cerr.rdbuf(capErr.rdbuf())};
-            int rc = app.run(static_cast<int>(argv.size()), argv.data());
-            CHECK(capErr.str().empty());
-            CHECK(rc == 0);
-            return slimr::parse_json(capOut.str());
-        };
-
-        auto spec = runOpenApi();
-        REQUIRE(spec.has_value());
-        CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
-        CHECK((*spec)["info"]["title"].get<std::string>() == "openapi-cli");
-        CHECK((*spec)["info"]["version"].get<std::string>() == "2.0.0");
-        CHECK((*spec)["paths"].contains("/add"));
-        CHECK((*spec)["paths"]["/add"].contains("post"));
-        CHECK_FALSE((*spec).contains("servers"));
-        CHECK_FALSE((*spec).contains("security"));
-        CHECK_FALSE((*spec)["components"].contains("securitySchemes"));
-        CHECK_FALSE((*spec)["paths"]["/add"]["post"]["responses"].contains("401"));
-
-#ifdef SLIMR_MCP_HAS_HTTP
-        McpHttpOptions httpOpts;
-        httpOpts.oauth.enabled = true;
-        enable_http(app, std::move(httpOpts));
-        auto oauthSpec = runOpenApi();
-        REQUIRE(oauthSpec.has_value());
-        CHECK((*oauthSpec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
-        CHECK((*oauthSpec).contains("security"));
-        CHECK((*oauthSpec)["paths"]["/add"]["post"]["responses"].contains("401"));
-        CHECK((*oauthSpec)["paths"]["/add"]["post"]["responses"].contains("403"));
-#endif
+        CHECK(e.find("Unknown command") != std::string::npos);
     }
 }
 
@@ -1315,10 +1098,10 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             CHECK(badSrv.start(&err) == false);
             CHECK(err.find("Invalid bind host") != std::string::npos);
         }
-        // Default options bind 0.0.0.0:0 directly
+        // Default options bind 127.0.0.1:0 directly
         {
             McpHttpOptions defOpts;
-            CHECK(defOpts.host == "0.0.0.0");
+            CHECK(defOpts.host == "127.0.0.1");
             CHECK(!defOpts.port.has_value());
             McpHttpServer defSrv(app, defOpts);
             std::string err;
@@ -1498,11 +1281,11 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         REQUIRE(sockJson.has_value());
         CHECK((*sockJson)["result"]["supportedVersions"][0].get<std::string>() == "2026-07-28");
 
-        // Plain GET /health and GET /schema from ServeHttpServer are also active
+        // Plain GET /health and GET /tools/schema from ServeHttpServer are also active
         auto healthRep = sockClient.Get("/health");
         REQUIRE(healthRep);
         CHECK(healthRep->status == 200);
-        auto schemaRep = sockClient.Get("/schema");
+        auto schemaRep = sockClient.Get("/tools/schema");
         REQUIRE(schemaRep);
         CHECK(schemaRep->status == 200);
 
@@ -1806,6 +1589,7 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         CHECK(run_args({"cli-http", "http", "--port", "not-a-number"}) == 2);
         CHECK(run_args({"cli-http", "http", "--port", "70000"}) == 2);
         CHECK(run_args({"cli-http", "http", "--unknown-flag"}) == 2);
+        CHECK(run_args({"cli-http", "http", "--tools"}) == 2);
         CHECK(run_args({"cli-http", "http", "--allow-ephemeral-port"}) == 2);
         CHECK(run_args({"cli-http", "http", "--host", "not-an-ip"}) == 2);
         CHECK(run_args({"cli-http", "--skip-checks", "http", "--host", "not-an-ip"}) == 2);
@@ -2069,8 +1853,8 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
         CHECK(insuff.requiredScopes == std::vector<std::string>{"mcp:read"});
     }
 
-    TEST_CASE("McpHttpServer GET /openapi.json unauthenticated with and without OAuth") {
-        // 1. Without OAuth
+    TEST_CASE("McpHttpServer /tools surface default-on, global opt-out, MRTR error, and OAuth audience parity") {
+        // 1. Default tools=true without OAuth: root tool routes 404, /tools/* 200
         {
             PluginApp app("openapi-http", "1.4.0");
             app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
@@ -2088,26 +1872,45 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             uint16_t port = srv.boundPort();
             REQUIRE(port != 0);
 
-            auto rGet = http_exchange(port, "GET", "/openapi.json", {{"Connection", "close"}}, "");
+            CHECK(http_exchange(port, "GET", "/openapi.json", {{"Connection", "close"}}, "").status == 404);
+            CHECK(http_exchange(port, "GET", "/schema", {{"Connection", "close"}}, "").status == 404);
+            CHECK(http_exchange(port, "POST", "/add",
+                                {{"Content-Type", "application/json"}, {"Connection", "close"}},
+                                R"({"a":1,"b":2})")
+                      .status == 404);
+
+            auto rGet = http_exchange(port, "GET", "/tools/openapi.json", {{"Connection", "close"}}, "");
             CHECK(rGet.status == 200);
             auto spec = slimr::parse_json(rGet.body);
             REQUIRE(spec.has_value());
             CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
             CHECK((*spec)["info"]["title"].get<std::string>() == "openapi-http");
             CHECK((*spec)["info"]["version"].get<std::string>() == "1.4.0");
-            CHECK((*spec)["paths"]["/add"].contains("post"));
+            CHECK((*spec)["paths"]["/tools/add"].contains("post"));
             CHECK_FALSE((*spec).contains("security"));
             CHECK_FALSE((*spec)["components"].contains("securitySchemes"));
 
-            auto rPost = http_exchange(port, "POST", "/openapi.json",
+            auto rPost = http_exchange(port, "POST", "/tools/openapi.json",
                                        {{"Content-Type", "application/json"}, {"Connection", "close"}}, "{}");
             CHECK(rPost.status == 405);
             CHECK(rPost.headers["allow"] == "GET");
 
+            auto rSchema = http_exchange(port, "GET", "/tools/schema", {{"Connection", "close"}}, "");
+            CHECK(rSchema.status == 200);
+
+            auto rTool = http_exchange(port, "POST", "/tools/add",
+                                       {{"Content-Type", "application/json"}, {"Connection", "close"}},
+                                       R"({"a":2,"b":3})");
+            CHECK(rTool.status == 200);
+            auto toolJson = slimr::parse_json(rTool.body);
+            REQUIRE(toolJson.has_value());
+            CHECK((*toolJson)["sum"].get<int64_t>() == 5);
+
             srv.stop();
         }
 
-        // 2. With OAuth enabled: GET /openapi.json stays unauthenticated and advertises bearerAuth
+        // 2. With OAuth enabled: /tools/openapi.json stays unauthenticated and advertises bearerAuth,
+        //    and /tools/* validates token audience against <base>/mcp even with --port 0
         {
             PluginApp app("openapi-oauth", "1.5.0");
             app.tool<AddInput>("add", "Adds two numbers", [](const AddInput &in) {
@@ -2121,8 +1924,31 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             opts.port = 0;
             opts.oauth.enabled = true;
             opts.oauth.expectedIssuers = {"https://auth.example.com"};
-            opts.oauth.validateToken = [](const TokenValidationContext &) {
-                return TokenValidationResult{.status = TokenValidationResult::Status::InvalidToken};
+            opts.oauth.validateToken = [](const TokenValidationContext &tctx) {
+                TokenValidationResult r;
+                if (tctx.token == "mcp-aud") {
+                    r.status = TokenValidationResult::Status::Valid;
+                    r.principal.authenticated = true;
+                    r.principal.subject = "user-1";
+                    r.principal.issuer = "https://auth.example.com";
+                    r.principal.audience = std::string(tctx.expectedResource);
+                    return r;
+                }
+                if (tctx.token == "base-aud") {
+                    r.status = TokenValidationResult::Status::Valid;
+                    r.principal.authenticated = true;
+                    r.principal.subject = "user-1";
+                    r.principal.issuer = "https://auth.example.com";
+                    std::string aud(tctx.expectedResource);
+                    auto pos = aud.rfind("/mcp");
+                    if (pos != std::string::npos) {
+                        aud.erase(pos);
+                    }
+                    r.principal.audience = std::move(aud);
+                    return r;
+                }
+                r.status = TokenValidationResult::Status::InvalidToken;
+                return r;
             };
             McpHttpServer srv(app, opts);
             std::string err;
@@ -2130,15 +1956,105 @@ TEST_SUITE("MCP Streamable HTTP & OAuth") {
             uint16_t port = srv.boundPort();
             REQUIRE(port != 0);
 
-            auto rGet = http_exchange(port, "GET", "/openapi.json", {{"Connection", "close"}}, "");
+            auto rGet = http_exchange(port, "GET", "/tools/openapi.json", {{"Connection", "close"}}, "");
             CHECK(rGet.status == 200);
             auto spec = slimr::parse_json(rGet.body);
             REQUIRE(spec.has_value());
             CHECK((*spec)["openapi"].get<std::string>() == "3.1.0");
             CHECK((*spec)["components"]["securitySchemes"]["bearerAuth"]["scheme"].get<std::string>() == "bearer");
             CHECK((*spec).contains("security"));
-            CHECK((*spec)["paths"]["/add"]["post"]["responses"].contains("401"));
-            CHECK((*spec)["paths"]["/add"]["post"]["responses"].contains("403"));
+            CHECK((*spec)["paths"]["/tools/add"]["post"]["responses"].contains("401"));
+            CHECK((*spec)["paths"]["/tools/add"]["post"]["responses"].contains("403"));
+
+            auto rOk = http_exchange(port, "POST", "/tools/add",
+                                     {{"Content-Type", "application/json"},
+                                      {"Authorization", "Bearer mcp-aud"},
+                                      {"Connection", "close"}},
+                                     R"({"a":4,"b":6})");
+            CHECK(rOk.status == 200);
+            auto okJson = slimr::parse_json(rOk.body);
+            REQUIRE(okJson.has_value());
+            CHECK((*okJson)["sum"].get<int64_t>() == 10);
+
+            auto rBadAud = http_exchange(port, "POST", "/tools/add",
+                                         {{"Content-Type", "application/json"},
+                                          {"Authorization", "Bearer base-aud"},
+                                          {"Connection", "close"}},
+                                         R"({"a":4,"b":6})");
+            CHECK(rBadAud.status == 401);
+
+            srv.stop();
+        }
+
+        // 3. Global opt-out (McpHttpOptions{.tools = false}): /tools/* return 404 while /mcp and /health stay 200
+        {
+            PluginApp app("tools-opt-out", "1.0.0");
+            app.tool<AddInput>("add", "Adds", [](const AddInput &in) {
+                Json res = json_obj();
+                res["sum"] = in.a.get() + in.b.get();
+                return res;
+            });
+
+            McpHttpOptions opts;
+            opts.host = "127.0.0.1";
+            opts.port = 0;
+            opts.tools = false;
+            McpHttpServer srv(app, opts);
+            std::string err;
+            REQUIRE(srv.start(&err));
+            uint16_t port = srv.boundPort();
+            REQUIRE(port != 0);
+
+            CHECK(http_exchange(port, "GET", "/health", {{"Connection", "close"}}, "").status == 200);
+            CHECK(http_exchange(port, "GET", "/tools/openapi.json", {{"Connection", "close"}}, "").status == 404);
+            CHECK(http_exchange(port, "GET", "/tools/schema", {{"Connection", "close"}}, "").status == 404);
+            CHECK(http_exchange(port, "POST", "/tools/add",
+                                {{"Content-Type", "application/json"}, {"Connection", "close"}},
+                                R"({"a":1,"b":2})")
+                      .status == 404);
+
+            auto rMcp = http_exchange(port, "POST", "/mcp",
+                                      mcp_headers("server/discover"),
+                                      slimr::write_json(make_req(1, "server/discover", json_obj())));
+            CHECK(rMcp.status == 200);
+
+            srv.stop();
+        }
+
+        // 4. MRTR inputRequired: /tools/<tool> returns 400 "use /mcp", while /mcp returns input_required
+        {
+            PluginApp app("mrtr-http", "1.0.0");
+            app.tool<std::monostate>("ask", "Requests follow-up input", [](const std::monostate &) {
+                Json reqs = json_obj();
+                reqs["choice"] = json_obj();
+                return McpResult::inputRequired(std::move(reqs), "step-1");
+            });
+
+            McpHttpOptions opts;
+            opts.host = "127.0.0.1";
+            opts.port = 0;
+            McpHttpServer srv(app, opts);
+            std::string err;
+            REQUIRE(srv.start(&err));
+            uint16_t port = srv.boundPort();
+            REQUIRE(port != 0);
+
+            auto rTool = http_exchange(port, "POST", "/tools/ask",
+                                       {{"Content-Type", "application/json"}, {"Connection", "close"}},
+                                       "{}");
+            CHECK(rTool.status == 400);
+            CHECK(rTool.body.find("use /mcp") != std::string::npos);
+
+            Json callParams = json_obj();
+            callParams["name"] = "ask";
+            callParams["arguments"] = json_obj();
+            auto rMcp = http_exchange(port, "POST", "/mcp",
+                                      mcp_headers("tools/call", "ask"),
+                                      slimr::write_json(make_req(1, "tools/call", callParams)));
+            CHECK(rMcp.status == 200);
+            auto mcpJson = slimr::parse_json(rMcp.body);
+            REQUIRE(mcpJson.has_value());
+            CHECK((*mcpJson)["result"]["resultType"].get<std::string>() == "input_required");
 
             srv.stop();
         }

@@ -204,7 +204,7 @@ struct CachePolicy {
     std::string resourcesListCacheScope{"public"};
 };
 
-inline ServeResult mcp_result_to_serve_result(McpResult mr) {
+inline ServeResult mcp_result_to_serve_result(McpResult mr, bool allowInputRequired = true) {
     if (mr.isError) {
         std::string msg;
         for (const auto &b : mr.content) {
@@ -219,6 +219,11 @@ inline ServeResult mcp_result_to_serve_result(McpResult mr) {
         return ServeResult::withExtension(std::move(mr), ServeResult::error(std::move(msg), 400));
     }
     if (mr.isInputRequired) {
+        if (!allowInputRequired) {
+            return ServeResult::withExtension(
+                std::move(mr),
+                ServeResult::error("Tool requires interactive input; use /mcp", 400));
+        }
         Json j = mr.toJson();
         return ServeResult::withExtension(std::move(mr), ServeResult::json(std::move(j)));
     }
@@ -262,13 +267,11 @@ class PluginApp : public ServeApp {
     std::vector<Resource> resources;
     CachePolicy cachePolicy;
 
-    PluginApp() : ServeApp() { allowCliTools = false; }
+    PluginApp() : ServeApp() {}
     PluginApp(PluginApp &&) noexcept = default;
     PluginApp &operator=(PluginApp &&) noexcept = default;
     explicit PluginApp(std::string appKey, std::string appVer = "1.0.0")
-        : ServeApp(std::move(appKey), std::move(appVer)) {
-        allowCliTools = false;
-    }
+        : ServeApp(std::move(appKey), std::move(appVer)) {}
 
     ServeApp &serve() noexcept { return *this; }
     const ServeApp &serve() const noexcept { return *this; }
@@ -297,7 +300,7 @@ class PluginApp : public ServeApp {
                             return h(in);
                         }
                     }();
-                    return mcp_result_to_serve_result(std::move(mr));
+                    return mcp_result_to_serve_result(std::move(mr), !ctx.protocolVersion.empty());
                 } catch (const McpProtocolException &pe) {
                     throw ServeException(pe.code, pe.what(), pe.data, 400);
                 }

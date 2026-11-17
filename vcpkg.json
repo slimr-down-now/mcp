@@ -1,7 +1,7 @@
 {
   "name": "slimr-mcp",
   "version": "0.1.2",
-  "description": "Header-only typed MCP servers and JSON CLIs",
+  "description": "Header-only typed MCP servers",
   "dependencies": [
     {
       "name": "slimr-bugsink",
