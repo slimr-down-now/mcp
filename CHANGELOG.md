@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.2.2 - 2026-11-17
+
+- feat: default-on /tools surface, OAuth audience parity, and slimr-serve v0.3.1 (#1)
+  * feat: use VCPKG_OVERLAY_PORTS and guard release
+  * chore: adopt PR CI/CD and contributing templates
+  * docs: maintainer setup for release App, secrets, rulesets
+  * docs: soft alignment marker and release-bot contributing docs
+  * feat: default-on /tools surface, McpHttpOptions::tools opt-out, MRTR error, OAuth audience parity
+  - Remove PluginApp --openapi test case: --openapi flag removed in slimr-serve
+  - Replace CLI direct invocation, allowCliTools/envelope, and CLI run tool-call assertions with CLI rejection tests: per-tool CLI removed
+  - Update default host assertion (127.0.0.1) and /tools/schema path in HTTP tests to match slimr-serve and /tools prefix
+  * build: bump slimr-serve baseline to v0.3.1
+- ci: poll gh run watch every 30s in release
+
 ## v0.2.1 - 2026-11-17
 
 - Forward OAuth OpenAPI defaults in `enable_http`, test `GET /openapi.json` and `--openapi`, and bump `slimr-serve` to `>= 0.2.0`.
